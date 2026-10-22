@@ -245,9 +245,16 @@ def _write_rotation_channels(rig, action, per_bone, frames, frame_start, frame_e
             curve = action.fcurves.find(prefix, index=k)
             if curve is None:
                 curve = action.fcurves.new(prefix, index=k, action_group=name)
-            for point in list(curve.keyframe_points):
-                if frame_start - 0.5 <= point.co[0] <= frame_end + 0.5:
-                    curve.keyframe_points.remove(point)
+            # Remove by index in reverse, rescanning until clean: holding
+            # references while removing invalidates them ("Keyframe not in
+            # F-Curve"), and retarget actions can hold duplicate keys per frame.
+            while True:
+                stale = [index for index, point in enumerate(curve.keyframe_points)
+                         if frame_start - 0.5 <= point.co[0] <= frame_end + 0.5]
+                if not stale:
+                    break
+                for index in reversed(stale):
+                    curve.keyframe_points.remove(curve.keyframe_points[index])
             inserted = len(curve.keyframe_points)
             curve.keyframe_points.add(len(frames))
             for index, frame in enumerate(frames):
