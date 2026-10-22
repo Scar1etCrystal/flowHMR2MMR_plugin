@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# agent — MoCap Doctor socket 客户端短入口：任何 shell（bash/zsh）、任何目录都能直接用。
+#   /home/sb/remote_kit_1.7.1/tools/agent <tool> '<json args>'
+# 输出默认 --pretty。不需要任何 shell 变量（每条命令都是新 shell，变量不会保留）。
+exec python3 "$(dirname "$(readlink -f "$0")")/agent_client.py" "$@" --pretty

@@ -1,0 +1,39 @@
+# Blender/user-generated project data
+blends/
+*.blend
+*.blend1
+*.vmd
+*.npy
+*.npz
+*.mp4
+
+# Generated packages and test sandboxes
+dist/
+.blender_test_tmp/
+.extension_validate_*/
+
+# Runtime logs and local recovery state
+*.log
+.mocap_doctor/
+blends/.mocap_doctor/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local agent/session metadata
+.agents/
+.codex/
+.repo_git/
+
+# Local-only notes, session reports and incident logs: kept on disk, never published
+HANDOFF.md
+PIPELINE_MAP.html
+index.md
+INCIDENT_*.md
+新方案.txt
+阶段A_汇总.md
+agent_reports/
+pack_patch_stage1/
+pack_patch_stage1.zip
