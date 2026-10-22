@@ -27,6 +27,7 @@ from .core import source as core_source
 from .core import target as core_target
 from .core.ranges import diff_ranges, frames_to_ranges
 from .presets import (
+    ROLE_LABELS,
     EXPECTED_FPS,
     MMD_ARM_FK_BONES,
     MMD_CENTER_BONE,
