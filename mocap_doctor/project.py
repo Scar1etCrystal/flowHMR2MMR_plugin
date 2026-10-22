@@ -500,8 +500,12 @@ def _guess_objects():
     meshes = [obj for obj in bpy.data.objects if obj.type == 'MESH']
     empties = [obj for obj in bpy.data.objects if obj.type == 'EMPTY']
     mmr = [obj for obj in armatures if has(obj, 'hand_fk.L', 'hand_fk.R', 'torso')]
-    mmd = [obj for obj in armatures if has(obj, '全ての親', 'センター', '上半身')]
     source = [obj for obj in armatures if has(obj, 'Pelvis', 'L_Wrist', 'R_Wrist')]
+    # MMR 骨架也带 MMD 骨名，必须排除，否则两条都被识别成 MMD 骨架 → 歧义。
+    mmd = [obj for obj in armatures
+           if obj not in mmr and obj not in source
+           and (has(obj, '全ての親') or has(obj, 'センター')
+                or (has(obj, '上半身') and has(obj, '下半身')))]
     meshes = [obj for obj in meshes if obj not in source]
     guessed = {
         "source_armature": source,

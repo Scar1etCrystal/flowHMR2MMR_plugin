@@ -317,10 +317,26 @@ def _require_object(settings, attribute, object_type=None, exact_name=None):
             obj = matches[0]
             setattr(settings, attribute, obj)
     if obj is None:
+        obj = _auto_detect_object(settings, attribute)
+    if obj is None:
         raise RuntimeError(f"请先选择{label}")
     if object_type and obj.type != object_type:
         raise RuntimeError(f"{label}类型不对")
     return obj
+
+
+def _auto_detect_object(settings, attribute):
+    """Late structural detection: the model often arrives after the project."""
+
+    try:
+        from . import project as project_module
+        scene = bpy.context.scene
+        if scene is None or not hasattr(scene, "mocap_doctor"):
+            return None
+        project_module.discover_known_objects(scene)
+        return getattr(settings, attribute, None)
+    except Exception:  # noqa: BLE001
+        return None
 
 def _require_action(owner, label):
     action = getattr(getattr(owner, "animation_data", None), "action", None)
@@ -2177,30 +2193,23 @@ class MD_OT_RetargetPrepare(Operator):
 def _apply_skeleton_fixes(context, settings):
     """Run A/B/C at the end of the retarget preview.
 
-    A and B always apply.  C needs planted intervals, so a missing/empty
-    detection is recorded as "skipped" instead of failing the whole retarget —
-    the user can detect intervals later and rerun the step.
+    These are refinements: when the scene lacks the required object or bone the
+    step is recorded as skipped instead of failing the whole retarget, so a
+    model with different bone names still gets a usable result.
     """
+
     reports = {}
     for letter, runner in _TARGET_FIXES.items():
         try:
             report, _details = runner(context, settings)
         except Exception as exc:  # noqa: BLE001
-            reason = str(exc)
-            reports[letter] = {'operation': letter, 'skipped': reason}
-            if letter == 'C' and 'planted' in reason:
-                continue
-            raise RuntimeError('骨架修复未完成：' + _short_reason(reason))
+            reports[letter] = {'operation': letter, 'skipped': _short_reason(str(exc))}
+            continue
         reports[letter] = report
         reason = _skipped_reason(report)
         if reason and reason != 'already applied':
-            if letter == 'C' and 'planted' in str(reason):
-                continue
-            if report.get('bones') or report.get('missing_bones'):
-                raise RuntimeError('骨架修复未完成：模型缺少所需骨骼')
-            raise RuntimeError('骨架修复未完成：' + _short_reason(reason))
+            reports[letter] = {'operation': letter, 'skipped': _short_reason(reason)}
     return reports
-
 
 def _run_target_skeleton_fix(context, settings):
     """DEPRECATED: retained for old scripts; normal workflow runs this in retarget."""
