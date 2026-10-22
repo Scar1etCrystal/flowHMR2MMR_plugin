@@ -32,7 +32,7 @@
 * 竖直面，世界法向 **−Y**（局部网格法向 +X，RZ(−90°) 正好把它送到 −Y），
   Blender 正视图 numpad-1 从 −Y 看过去正对画面；
 * 底边贴 **Z=0**（缩放之后再抬）、X 居中、宽高按视频真实宽高比；
-* 高度是参数（默认 1.60 m ≈ Teto 身高，是**缩放前**的基准；世界高度 = 基准 × 1.5）；
+* 高度是参数（默认 1.60 m ≈ 模型 身高，是**缩放前**的基准；世界高度 = 基准 × 1.5）；
 * 沿 Y 的位置是参数，默认 **+1.0 m**（用户指定）：角色静止朝 −Y、正视镜头在 −Y 一侧，
   平面放在 +Y 就是「角色在画面前面、视频在后面」，1 m 也不会插进角色身体；
 * 帧对齐：视频帧号是 1 基，``Blender 帧 f 显示视频第 f−offset 帧``（默认 offset=0；
@@ -70,7 +70,7 @@ OFFICIAL_NPZ_SUFFIX = "_OFFICIAL_post.npz"
 DEFAULT_PLANE_RZ_DEG = -90.0       # 局部 +X 法向 → 世界 −Y（正视图 numpad-1 正对画面）
 DEFAULT_PLANE_Y_M = 1.0            # 角色朝 −Y、镜头在 −Y 一侧 → +Y 1.0 m = 角色身后 1 m
 DEFAULT_PLANE_SCALE = 1.5          # 用户要的"放大 1.5 左右"
-DEFAULT_PLANE_HEIGHT_M = 1.60      # 缩放**前**的基准高度 ≈ Teto 身高；世界高度 = 1.6×1.5 = 2.4 m
+DEFAULT_PLANE_HEIGHT_M = 1.60      # 缩放**前**的基准高度 ≈ 模型 身高；世界高度 = 1.6×1.5 = 2.4 m
 PLANE_OBJECT_NAME = "MCD_reference_video"
 PLANE_MATERIAL_NAME = "MCD_reference_video_mat"
 

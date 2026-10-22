@@ -1,4 +1,4 @@
-"""Fixed FreeMoCap and arue Teto/MMR preset for Blender 4.3."""
+"""Presets and role names for FlowHMR -> MMR -> MMD retargeting."""
 
 import math
 import re
@@ -7,26 +7,37 @@ import re
 EXPECTED_FPS = 30
 
 OBJECT_NAMES = {
-    "source_armature": "import_synchronized_videos_rig",
-    "model_root": "arue式重音テトver 2.01",
-    "mmr_rig": "RIG-arue式重音テトver 2.01_arm",
-    "mmd_armature": "arue式重音テトver 2.01_arm",
-    "target_mesh": "arue式重音テトver 2.01_mesh",
-    "correction_empty": "teto_global_correction",
+    # 角色 -> 默认名称提示。留空表示只按类型/结构匹配，不绑定任何具体模型。
+    "source_armature": "Reference",
+    "model_root": "",
+    "mmr_rig": "",
+    "mmd_armature": "",
+    "target_mesh": "",
+    "correction_empty": "mocap_global_correction",
+}
+
+ROLE_LABELS = {
+    "source_armature": "源骨架",
+    "model_root": "模型根对象",
+    "mmr_rig": "目标骨架",
+    "mmd_armature": "MMD 骨架",
+    "target_mesh": "模型网格",
+    "correction_empty": "校正对象",
 }
 
 
 def fixed_object_name_matches(actual: str, expected: str) -> bool:
-    """Accept Blender's duplicate suffix without weakening the fixed preset.
+    """Name hint matching, tolerant of Blender's duplicate suffix.
 
-    Importing an additional copy of the same Teto model makes Blender rename
-    datablocks to ``.001``, ``.002`` and so on.  Those suffixes are naming
-    disambiguators, not structural changes to the rig.
+    An empty ``expected`` means "no name hint": matching then fails on purpose so
+    callers fall back to structural detection instead of guessing a model name.
+    ``.001``/``.002`` suffixes are disambiguators, not structural changes.
     """
 
-    return bool(
-        re.fullmatch(rf"{re.escape(str(expected))}(?:\.\d{{3}})?", str(actual))
-    )
+    expected = str(expected or "").strip()
+    if not expected:
+        return False
+    return bool(re.fullmatch(rf"{re.escape(expected)}(?:\.\d{{3}})?", str(actual)))
 
 SOURCE_BONES = {
     "hips": "pelvis",
@@ -257,14 +268,14 @@ TARGET_FOOT_IK = {"L": "foot_ik.L", "R": "foot_ik.R"}
 
 MMD_ROOT_BONE = "全ての親"
 MMD_CENTER_BONE = "センター"
-# These are the real Blender bone names in blends/arue_teto.blend.
+# These are the real Blender bone names in the MMD template blend used during development.
 MMD_LEG_FK_BONES = ["足.L", "ひざ.L", "足首.L", "足.R", "ひざ.R", "足首.R"]
 # The physical MMD arm chain. A portable VMD must contain its visible pose.
 MMD_ARM_FK_BONES = ["腕.L", "ひじ.L", "手首.L", "腕.R", "ひじ.R", "手首.R"]
 MMD_WRIST_BONES = {"L": "手首.L", "R": "手首.R"}
 MMD_HAND_IK_BONES = {"L": "手IK.L", "R": "手IK.R"}
 # MikuMikuRig temporarily reparents the elbow directly under the upper arm.
-# A normal Teto MMD hierarchy keeps it below the upper-arm twist bone.
+# A normal MMD hierarchy keeps it below the upper-arm twist bone.
 MMD_ELBOW_BONES = {"L": "ひじ.L", "R": "ひじ.R"}
 MMD_ARM_TWIST_BONES = {"L": "腕捩.L", "R": "腕捩.R"}
 MMD_WRIST_NAME_CANDIDATES = {
@@ -378,7 +389,7 @@ def _mmd_japanese_name(pose_bone):
 
 
 def _resolve_hand_bone(armature, side, *, helper):
-    """Resolve one fixed Teto hand bone without accepting ambiguous guesses.
+    """Resolve one MMD hand bone without accepting ambiguous guesses.
 
     Blender bone names can acquire suffixes or differ in full-width ``ＩＫ``
     spelling after import.  mmd_tools' ``name_j`` is the authoritative MMD
@@ -399,7 +410,7 @@ def _resolve_hand_bone(armature, side, *, helper):
         return by_blender[0]
     if len(by_blender) > 1:
         raise RuntimeError(
-            f"固定 Teto {side} 侧存在多个候选{'手 IK' if helper else '手首'}骨骼："
+            f"{side} 侧存在多个候选{'手 IK' if helper else '手首'}骨骼："
             + ", ".join(bone.name for bone in by_blender)
         )
 
@@ -412,7 +423,7 @@ def _resolve_hand_bone(armature, side, *, helper):
         return by_mmd[0]
     if len(by_mmd) > 1:
         raise RuntimeError(
-            f"固定 Teto {side} 侧 mmd_tools 手部映射不唯一："
+            f"{side} 侧 mmd_tools 手部映射不唯一："
             + ", ".join(bone.name for bone in by_mmd)
         )
     return None
@@ -426,10 +437,10 @@ def _side_matches_name(name, side):
 
 
 def _resolve_hand_ik_from_constraints(armature, side):
-    """Find a non-standard hand IK helper from the fixed Teto elbow IK rig.
+    """Find a non-standard hand IK helper from the the model's elbow IK rig.
 
     The helper is not a normal VMD bone: it is the ``subtarget`` used by the
-    elbow's IK constraint.  This is a structural fallback for imported Teto
+    elbow's IK constraint.  This is a structural fallback for imported model
     files where the helper's Blender name changed beyond a simple ``.001``
     suffix.  It deliberately accepts only one side-matching target.
     """
@@ -453,14 +464,14 @@ def _resolve_hand_ik_from_constraints(armature, side):
         return values[0]
     if len(values) > 1:
         raise RuntimeError(
-            f"固定 Teto {side} 侧 IK 约束指向多个候选手 IK 骨骼："
+            f"{side} 侧 IK 约束指向多个候选手 IK 骨骼："
             + ", ".join(sorted(bone.name for bone in values))
         )
     return None
 
 
 def resolve_mmd_hand_bones(armature, side):
-    """Return ``(wrist, hand_ik)`` pose bones for one side of fixed Teto."""
+    """Return ``(wrist, hand_ik)`` pose bones for one side of the model."""
 
     wrist = _resolve_hand_bone(armature, side, helper=False)
     helper = _resolve_hand_bone(armature, side, helper=True)

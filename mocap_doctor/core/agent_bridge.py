@@ -93,8 +93,8 @@ def _source_armature(settings):
 
 
 def _rig_armature(settings, scene=None):
-    """The MMR control rig is what the agent layer operates on: Teto 自身没有
-    action（全靠约束跟 RIG），源骨架 f_avg 与 Teto 间是烘焙链路——修源骨架
+    """The MMR control rig is what the agent layer operates on: 模型 自身没有
+    action（全靠约束跟 RIG），源骨架 f_avg 与 模型 间是烘焙链路——修源骨架
     下游看不到，修 RIG 立刻反映到最终模型。"""
     rig = getattr(settings, "mmr_rig", None)
     if rig is not None and getattr(rig, "type", "") == "ARMATURE":

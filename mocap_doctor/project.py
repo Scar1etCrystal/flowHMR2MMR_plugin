@@ -485,27 +485,75 @@ def parameter_hash(data):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _guess_objects():
+    """Structural guesses for the six roles, independent of any model name."""
+
+    from .presets import OBJECT_NAMES
+
+    def bones(obj):
+        return {bone.name for bone in obj.data.bones} if obj.type == 'ARMATURE' else set()
+
+    def has(obj, *names):
+        return bool(bones(obj) & set(names))
+
+    armatures = [obj for obj in bpy.data.objects if obj.type == 'ARMATURE']
+    meshes = [obj for obj in bpy.data.objects if obj.type == 'MESH']
+    empties = [obj for obj in bpy.data.objects if obj.type == 'EMPTY']
+    mmr = [obj for obj in armatures if has(obj, 'hand_fk.L', 'hand_fk.R', 'torso')]
+    mmd = [obj for obj in armatures if has(obj, '全ての親', 'センター', '上半身')]
+    source = [obj for obj in armatures if has(obj, 'Pelvis', 'L_Wrist', 'R_Wrist')]
+    meshes = [obj for obj in meshes if obj not in source]
+    guessed = {
+        "source_armature": source,
+        "mmr_rig": mmr,
+        "mmd_armature": mmd,
+        "target_mesh": [],
+        "model_root": [],
+        "correction_empty": [obj for obj in bpy.data.objects
+                             if fixed_object_name_matches(obj.name, OBJECT_NAMES["correction_empty"])],
+    }
+    mmd_obj = mmd[0] if len(mmd) == 1 else None
+    if mmd_obj is not None:
+        skinned = [obj for obj in meshes
+                   if any(mod.type == 'ARMATURE' and mod.object == mmd_obj for mod in obj.modifiers)]
+        if not skinned:
+            skinned = [obj for obj in meshes
+                       if any(mod.type == 'ARMATURE' for mod in obj.modifiers)]
+        if skinned:
+            guessed["target_mesh"] = [max(skinned, key=lambda obj: len(obj.data.vertices))]
+        parent = mmd_obj.parent
+        while parent is not None and parent.type != 'EMPTY':
+            parent = parent.parent
+        if parent is not None:
+            guessed["model_root"] = [parent]
+        else:
+            stem = mmd_obj.name.rsplit("_arm", 1)[0]
+            guessed["model_root"] = [obj for obj in empties if obj.name == stem]
+    return {role: (items[0] if len(items) == 1 else None) for role, items in guessed.items()}
+
+
 def discover_known_objects(scene):
     settings = scene.mocap_doctor
-    for attr, name in OBJECT_NAMES.items():
-        if hasattr(settings, attr):
-            obj = bpy.data.objects.get(name)
-            if obj is None:
-                candidates = [
-                    item
-                    for item in bpy.data.objects
-                    if fixed_object_name_matches(item.name, name)
-                ]
-                # Auto-discovery is conservative when multiple imported Teto
-                # copies exist; the user can choose the intended one manually.
-                obj = candidates[0] if len(candidates) == 1 else None
-            if obj is not None:
-                setattr(settings, attr, obj)
+    from .presets import OBJECT_NAMES
+
+    for attr, hint in OBJECT_NAMES.items():
+        if not hasattr(settings, attr) or getattr(settings, attr) is not None:
+            continue
+        obj = bpy.data.objects.get(hint) if hint else None
+        if obj is None and hint:
+            matches = [item for item in bpy.data.objects
+                       if fixed_object_name_matches(item.name, hint)]
+            obj = matches[0] if len(matches) == 1 else None
+        if obj is not None:
+            setattr(settings, attr, obj)
+    for attr, obj in _guess_objects().items():
+        if hasattr(settings, attr) and getattr(settings, attr) is None and obj is not None:
+            setattr(settings, attr, obj)
     return {
         attr: getattr(settings, attr)
-        for attr in ("source_armature", "model_root", "mmr_rig", "mmd_armature", "target_mesh", "correction_empty")
+        for attr in ("source_armature", "model_root", "mmr_rig", "mmd_armature",
+                     "target_mesh", "correction_empty")
     }
-
 
 def delete_checkpoints(scene):
     """Remove every checkpoint file and forget the recorded paths."""

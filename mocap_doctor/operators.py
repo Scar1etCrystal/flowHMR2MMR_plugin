@@ -305,32 +305,21 @@ def _step_label(step_id):
 
 
 def _require_object(settings, attribute, object_type=None, exact_name=None):
+    """Return the configured object for a role, adopting it by name when unique."""
+
+    label = ROLE_LABELS.get(attribute, attribute)
     obj = getattr(settings, attribute, None)
     if obj is None and exact_name:
-        # The target objects are fixed presets, and they usually arrive AFTER
-        # the project was created: the retarget step is what imports Teto and
-        # the MMR rig.  A stale pointer then reported "缺少对象" for an object
-        # sitting right there in the scene, so adopt it by name when the name
-        # is unambiguous.  「发现对象」 still does the explicit pass.
-        matches = [
-            item for item in bpy.data.objects if fixed_object_name_matches(item.name, exact_name)
-        ]
+        matches = [item for item in bpy.data.objects
+                   if fixed_object_name_matches(item.name, exact_name)]
         if len(matches) == 1:
             obj = matches[0]
             setattr(settings, attribute, obj)
     if obj is None:
-        if exact_name:
-            raise RuntimeError(
-                f"缺少对象：{attribute}（场景里没有名为 {exact_name} 的对象；"
-                "导入 Teto/MMR 后请点「发现对象」）"
-            )
-        raise RuntimeError(f"缺少对象：{attribute}")
+        raise RuntimeError(f"请先选择{label}")
     if object_type and obj.type != object_type:
-        raise RuntimeError(f"{obj.name} 不是 {object_type} 对象")
-    if exact_name and not fixed_object_name_matches(obj.name, exact_name):
-        raise RuntimeError(f"只支持固定对象 {exact_name}（允许 Blender 重名后缀 .001/.002），当前为 {obj.name}")
+        raise RuntimeError(f"{label}类型不对")
     return obj
-
 
 def _require_action(owner, label):
     action = getattr(getattr(owner, "animation_data", None), "action", None)
@@ -359,7 +348,7 @@ def _leg_ik_toggle_targets(armature, foot_ik):
 def _resolve_correction_empty(settings):
     """The outer correction Empty, or ``None`` when 全局扶正 was never run.
 
-    The Empty is created by the "Teto 全局扶正" step and carries its hand tuned
+    The Empty is created by the "全局扶正" step and carries its hand tuned
     tilt.  A gravity aligned source (the GVHMR front end) needs no such tilt, so
     skipping that step is a legitimate route: nothing then owns a world level
     transform, and export_prep has nothing to bake into 全ての親.
@@ -450,18 +439,18 @@ def _planted_ranges(scene):
 
 
 def _validate_mmd_identity(settings):
-    root = _require_object(settings, "model_root", "EMPTY", OBJECT_NAMES["model_root"])
-    armature = _require_object(settings, "mmd_armature", "ARMATURE", OBJECT_NAMES["mmd_armature"])
-    rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+    root = _require_object(settings, "model_root", "EMPTY")
+    armature = _require_object(settings, "mmd_armature", "ARMATURE")
+    rig = _require_object(settings, "mmr_rig", "ARMATURE")
     if armature.parent != root:
-        raise RuntimeError("原生 MMD Armature 不在固定 Teto MMD Root 下")
+        raise RuntimeError("MMD 骨架不在 mmd_tools ROOT 下")
     marker = getattr(root, "mmd_type", "")
     if marker not in {None, "", "ROOT"}:
-        raise RuntimeError("Teto 根对象不是 mmd_tools ROOT")
+        raise RuntimeError("模型根对象不是 mmd_tools ROOT")
     # mmd_root also survives as an ID property in files saved with mmd_tools
     # when the addon itself is not loaded in this Blender session.
     if marker != "ROOT" and not (hasattr(root, "mmd_root") or root.get("mmd_root") is not None):
-        raise RuntimeError("无法确认 Teto 的 mmd_tools 根结构")
+        raise RuntimeError("无法确认 mmd_tools 根结构")
     missing = [
         name
         for name in (MMD_ROOT_BONE, MMD_CENTER_BONE, *MMD_LEG_FK_BONES)
@@ -472,12 +461,12 @@ def _validate_mmd_identity(settings):
     foot_ik = {side: resolve_mmd_foot_ik(armature, side) for side in ("L", "R")}
     if not all(foot_ik.values()):
         raise RuntimeError("无法通过 mmd_tools 元数据确认左右足 IK")
-    mesh = _require_object(settings, "target_mesh", "MESH", OBJECT_NAMES["target_mesh"])
+    mesh = _require_object(settings, "target_mesh", "MESH")
     if mesh.parent != armature:
-        raise RuntimeError("Teto Mesh 不在固定原生 MMD Armature 下")
+        raise RuntimeError("模型网格不在 MMD 骨架下")
     armature_modifiers = [modifier for modifier in mesh.modifiers if modifier.type == "ARMATURE"]
     if not any(getattr(modifier, "object", None) == armature for modifier in armature_modifiers):
-        raise RuntimeError("Teto Mesh 的 Armature Modifier 未指向固定 MMD 骨架")
+        raise RuntimeError("网格的 Armature 修改器未指向 MMD 骨架")
     return root, armature, rig, foot_ik
 
 
@@ -504,7 +493,7 @@ def _validate_mmd_constraint_mapping(settings):
         if not valid:
             errors.append(bone_name)
     if errors:
-        raise RuntimeError("MMR 腿部约束与 arue Teto 基准不一致：" + ", ".join(errors))
+        raise RuntimeError("MMR 腿部约束不一致：" + ", ".join(errors))
     invalid_targets = []
     for bone in armature.pose.bones:
         for constraint in bone.constraints:
@@ -714,56 +703,20 @@ def _require_project(context):
 
 
 def _default_template_path():
+    """Optional baseline .blend shipped next to the project, if any."""
+
     current = Path(bpy.data.filepath) if bpy.data.filepath else None
-    candidates = []
-    if current:
-        candidates.extend(
-            [
-                current.parent / "arue_teto.blend",
-                current.parent / "blends" / "arue_teto.blend",
-                current.parent.parent / "blends" / "arue_teto.blend",
-            ]
-        )
+    if not current:
+        return ""
+    candidates = [
+        current.parent / "template.blend",
+        current.parent / "blends" / "template.blend",
+        current.parent.parent / "blends" / "template.blend",
+    ]
     for path in candidates:
         if path.is_file():
             return str(path)
     return ""
-
-
-@contextmanager
-def _active_armature(context, armature, pose=False):
-    view_layer = context.view_layer
-    selected = [obj for obj in view_layer.objects if obj.select_get()]
-    active = view_layer.objects.active
-    old_mode = active.mode if active else "OBJECT"
-    try:
-        if active and active.mode != "OBJECT":
-            bpy.ops.object.mode_set(mode="OBJECT")
-        bpy.ops.object.select_all(action="DESELECT")
-        armature.hide_set(False)
-        armature.select_set(True)
-        view_layer.objects.active = armature
-        if pose:
-            bpy.ops.object.mode_set(mode="POSE")
-        yield
-    finally:
-        try:
-            if view_layer.objects.active and view_layer.objects.active.mode != "OBJECT":
-                bpy.ops.object.mode_set(mode="OBJECT")
-        except RuntimeError:
-            pass
-        bpy.ops.object.select_all(action="DESELECT")
-        for obj in selected:
-            if obj.name in view_layer.objects:
-                obj.select_set(True)
-        if active and active.name in view_layer.objects:
-            view_layer.objects.active = active
-            if old_mode != "OBJECT":
-                try:
-                    bpy.ops.object.mode_set(mode=old_mode)
-                except RuntimeError:
-                    pass
-
 
 def remove_bone_fcurves(action, bone_names):
     prefixes = tuple(f'pose.bones["{name}"]' for name in bone_names)
@@ -890,12 +843,12 @@ def _require_complete_arm_fk_animation(action, armature, frame_start, frame_end)
         raise RuntimeError("上肢 Bake 不完整，不能导出 VMD：" + ", ".join(missing))
 
 
-def _visual_bake_teto_arm_fk(scene, armature, action, frame_start, frame_end):
+def _visual_bake_mmd_arm_fk(scene, armature, action, frame_start, frame_end):
     """Bake the evaluated upper-arm/elbow/wrist result into real FK bones."""
 
     missing = [name for name in MMD_ARM_FK_BONES if armature.pose.bones.get(name) is None]
     if missing:
-        raise RuntimeError("固定 Teto 缺少上肢骨骼：" + ", ".join(missing))
+        raise RuntimeError("MMD 骨架缺少上肢骨骼：" + ", ".join(missing))
     if armature.animation_data is None or armature.animation_data.action is not action:
         raise RuntimeError("MMD Action 不是原生骨架的活动 Action，无法烘焙上肢")
     with _active_armature(bpy.context, armature, pose=True):
@@ -914,7 +867,7 @@ def _visual_bake_teto_arm_fk(scene, armature, action, frame_start, frame_end):
     return {"bones": list(MMD_ARM_FK_BONES), "frame_range": [int(frame_start), int(frame_end)]}
 
 
-def _resolve_teto_hand_ik_helpers(armature):
+def _resolve_mmd_hand_ik_helpers(armature):
     """Return Blender-only MMR hand helpers, keeping real wrists mandatory."""
 
     helpers = {}
@@ -922,7 +875,7 @@ def _resolve_teto_hand_ik_helpers(armature):
     for side in ("L", "R"):
         wrist, helper = resolve_mmd_hand_bones(armature, side)
         if wrist is None:
-            raise RuntimeError(f"固定 Teto 缺少 {side} 侧真实手首骨骼")
+            raise RuntimeError(f"MMD 骨架缺少 {side} 侧手首骨骼")
         if helper is None:
             absent_sides.append(side)
         else:
@@ -983,12 +936,12 @@ def _rekey_bone_world_pose(scene, armature, action, poses, frame_start, frame_en
     return written
 
 
-def _restore_teto_elbow_parents_and_remove_helpers(
+def _restore_mmd_elbow_parents_and_remove_helpers(
     scene, armature, action, helper_names, frame_start, frame_end
 ):
-    """Restore Teto's arm hierarchy, then delete MMR's temporary hand bones.
+    """Restore the model's arm hierarchy, then delete MMR's temporary hand bones.
 
-    MMR hangs ``ひじ`` directly off ``腕``; Teto itself routes it through the
+    MMR hangs ``ひじ`` directly off ``腕``; 模型 itself routes it through the
     ``腕捩`` twist bone.  ``腕捩`` carries a real pose of its own, so the swap
     alone would swing the whole forearm - record the evaluated elbows first and
     re-key them against the restored hierarchy afterwards.
@@ -1022,14 +975,14 @@ def _restore_teto_elbow_parents_and_remove_helpers(
             elbow = edit_bones.get(elbow_name)
             twist = edit_bones.get(twist_name)
             if elbow is None or twist is None:
-                raise RuntimeError(f"固定 Teto 缺少 {side} 侧肘部或腕捩骨骼")
+                raise RuntimeError(f"MMD 骨架缺少 {side} 侧肘部或腕捩骨骼")
             parent = elbow.parent
             if parent == twist:
                 continue
             if parent is None or parent.name != upper_arm_name:
                 found = parent.name if parent else "无父级"
                 raise RuntimeError(
-                    f"{elbow_name} 的父级是 {found}，不是固定 Teto 的 {upper_arm_name} 或 {twist_name}；"
+                    f"{elbow_name} 的父级是 {found}，不是MMD 骨架 的 {upper_arm_name} 或 {twist_name}；"
                     "为避免猜测性改骨，已停止导出"
                 )
             elbow.parent = twist
@@ -1059,7 +1012,7 @@ def _restore_teto_elbow_parents_and_remove_helpers(
     return restored_parents, deleted_helpers, rekeyed
 
 
-def _prepare_teto_mmr_hand_export_cleanup(
+def _prepare_mmd_mmr_hand_export_cleanup(
     scene,
     armature,
     action,
@@ -1068,7 +1021,7 @@ def _prepare_teto_mmr_hand_export_cleanup(
     *,
     matrix_tolerance=1.0e-4,
 ):
-    """Convert MMR's temporary hand controls back into a portable Teto arm."""
+    """Convert MMR's temporary hand controls back into a portable 模型 arm."""
 
     # MMD Bake already creates the physical arm keys. Re-baking here can
     # overwrite a valid manual Bake under MMR's altered elbow hierarchy.
@@ -1082,7 +1035,7 @@ def _prepare_teto_mmr_hand_export_cleanup(
     original_frame = int(scene.frame_current)
     try:
         before = _sample_pose_bone_matrices(scene, armature, arm_names, frame_start, frame_end)
-        helpers, absent_helpers = _resolve_teto_hand_ik_helpers(armature)
+        helpers, absent_helpers = _resolve_mmd_hand_ik_helpers(armature)
         helper_names = list(helpers.values())
         removed_constraints = _remove_mmr_hand_helper_constraints(armature, helper_names)
         removed_curves = {
@@ -1090,7 +1043,7 @@ def _prepare_teto_mmr_hand_export_cleanup(
             for helper_name in helper_names
         }
         restored_parents, deleted_helpers, rekeyed = (
-            _restore_teto_elbow_parents_and_remove_helpers(
+            _restore_mmd_elbow_parents_and_remove_helpers(
                 scene, armature, action, helper_names, frame_start, frame_end
             )
         )
@@ -1107,7 +1060,7 @@ def _prepare_teto_mmr_hand_export_cleanup(
             f"最大矩阵误差 {maximum_error:.6g}"
         )
     return {
-        "operation": "prepare_teto_mmr_hand_export_cleanup",
+        "operation": "prepare_mmd_mmr_hand_export_cleanup",
         "arm_fk_bake": arm_bake,
         "restored_elbow_parents": restored_parents,
         "rekeyed_elbow_frames": rekeyed,
@@ -1444,10 +1397,8 @@ def _run_contacts(context, settings):
 def _run_global_correction(context, settings):
     scene = context.scene
     _require_restore_before_rerun(scene, "global_correction")
-    model_root = _require_object(
-        settings, "model_root", "EMPTY", OBJECT_NAMES["model_root"]
-    )
-    rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+    model_root = _require_object(settings, "model_root", "EMPTY")
+    rig = _require_object(settings, "mmr_rig", "ARMATURE")
     _begin_structure_preview(scene, "global_correction")
     correction = core_target.ensure_global_correction_empty(
         OBJECT_NAMES["correction_empty"], collection=scene.collection
@@ -1465,16 +1416,16 @@ def _run_global_correction(context, settings):
         "global_correction",
         result,
         "PREVIEW",
-        "Teto 全局扶正等待检查",
+        "全局扶正等待检查",
         {"rotation_degrees": degrees},
     )
-    return "Teto 全局扶正预览已生成"
+    return "全局扶正预览已生成"
 
 
 def _run_tilt(context, settings):
     scene = context.scene
     _require_restore_before_rerun(scene, "tilt")
-    rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+    rig = _require_object(settings, "mmr_rig", "ARMATURE")
     _require_action(rig, "MMR Rig")
     _ensure_no_pending_preview(settings, "tilt")
     action = project.begin_action_preview(scene, rig, "tilt")
@@ -1499,10 +1450,8 @@ def _run_tilt(context, settings):
 def _run_target_floor(context, settings):
     scene = context.scene
     _require_restore_before_rerun(scene, "target_floor")
-    model_root = _require_object(
-        settings, "model_root", "EMPTY", OBJECT_NAMES["model_root"]
-    )
-    rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+    model_root = _require_object(settings, "model_root", "EMPTY")
+    rig = _require_object(settings, "mmr_rig", "ARMATURE")
     _ensure_no_pending_preview(settings, "target_floor")
     correction, created_correction = _ensure_correction_empty(
         settings, model_root, rig
@@ -1531,7 +1480,7 @@ def _run_target_floor(context, settings):
         **params,
     )
     result["created_correction_empty"] = created_correction
-    _record_report(scene, "target_floor", result, "PREVIEW", "Teto Mesh 穿地修复等待检查", params)
+    _record_report(scene, "target_floor", result, "PREVIEW", "模型 Mesh 穿地修复等待检查", params)
     message = f"Mesh 地面修复影响 {result.get('changed_frames', 0)} 帧"
     if created_correction:
         message += "；已补建全局校正 Empty（未扶正）"
@@ -1544,11 +1493,9 @@ def _run_foot_lock(context, settings):
     planted = _planted_ranges(scene)
     if not any(planted.values()):
         raise RuntimeError("最终 planted 区间为空，请先完成接触区间修订")
-    rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+    rig = _require_object(settings, "mmr_rig", "ARMATURE")
     _require_action(rig, "MMR Rig")
-    armature = _require_object(
-        settings, "mmd_armature", "ARMATURE", OBJECT_NAMES["mmd_armature"]
-    )
+    armature = _require_object(settings, "mmd_armature", "ARMATURE")
     # The closed loop measures the ankle through the MMR copy constraints;
     # with them muted (i.e. after a bake) it would correct against a frozen
     # bone and write garbage.  Fail before touching anything.
@@ -1595,7 +1542,7 @@ def _run_foot_lock(context, settings):
     # locks that only ever saw the controller side of the constraint chain.
     # The pelvis pass runs inside it first: per-frame the model's leg reach
     # ratio is re-solved onto the source skeleton's (restoring the captured
-    # knee bend Teto's longer legs were flattening), which lowers torso_root
+    # knee bend the model's longer legs were flattening), which lowers torso_root
     # enough that planted anchors at floor height stay physically reachable.
     stabilized = core_target.stabilize_planted_feet(
         scene,
@@ -1628,7 +1575,7 @@ def _run_foot_lock(context, settings):
         blend_frames=settings.lock_blend_frames,
     )
     report = {
-        "operation": "analyze_and_lock_teto_foot_ik",
+        "operation": "analyze_and_lock_mmd_foot_ik",
         "drift_before": drift,
         "repair": repair,
         "stabilize": stabilized,
@@ -1708,7 +1655,7 @@ def _run_ground_feet(context, settings):
     if not planted_spans:
         raise RuntimeError("没有贴地区间，请先检测贴地区间")
     # The pin works on ankle bones; the shoe sole hangs below them by the
-    # model's own bind-pose drop (~5.6 cm on Teto).  Read it off the model
+    # model's own bind-pose drop (~5.6 cm on 模型).  Read it off the model
     # instead of carrying a hand tuned default.
     sole_offset = core_target.model_sole_offset(armature, settings.target_mesh)
     params = {
@@ -1763,7 +1710,7 @@ def _run_export_prep(context, settings):
     correction = _resolve_correction_empty(settings)
     if correction is not None:
         if model_root.parent != correction or rig.parent != correction:
-            raise RuntimeError("Teto MMD Root 与 MMR Rig 必须共同位于全局校正 Empty 下")
+            raise RuntimeError("模型 MMD Root 与 MMR Rig 必须共同位于全局校正 Empty 下")
         _validate_correction_transform(correction)
     if _active_mmr_constraints(armature, rig):
         raise RuntimeError("仍有活动的 MMR 到 MMD 约束；请先完成并接受 MMD Bake")
@@ -1782,7 +1729,7 @@ def _run_export_prep(context, settings):
         baked = {
             "operation": "bake_global_correction_to_all_parent",
             "skipped": True,
-            "reason": "没有全局校正 Empty（“Teto 全局扶正”未执行）",
+            "reason": "没有全局校正 Empty（“全局扶正”未执行）",
             "frames_keyed": 0,
             "values_written": 0,
         }
@@ -1799,7 +1746,7 @@ def _run_export_prep(context, settings):
         )
     delete_leg_fk, leg_reason = _leg_fk_cleanup_plan(armature, foot_ik)
     if delete_leg_fk:
-        cleaned = core_export.remove_teto_leg_fk_curves(
+        cleaned = core_export.remove_mmd_leg_fk_curves(
             action, bone_names=MMD_LEG_FK_BONES
         )
         leg_ik = {
@@ -1809,7 +1756,7 @@ def _run_export_prep(context, settings):
         }
     else:
         cleaned = {
-            "operation": "remove_teto_leg_fk_curves",
+            "operation": "remove_mmd_leg_fk_curves",
             "skipped": True,
             "reason": leg_reason,
             "removed_fcurve_count": 0,
@@ -1825,7 +1772,7 @@ def _run_export_prep(context, settings):
             frame_start=settings.mocap_frame_start,
             frame_end=settings.mocap_frame_end,
         )
-    hand_export_cleanup = _prepare_teto_mmr_hand_export_cleanup(
+    hand_export_cleanup = _prepare_mmd_mmr_hand_export_cleanup(
         scene,
         armature,
         action,
@@ -1850,7 +1797,7 @@ def _run_export_prep(context, settings):
         require_clean_fk=delete_leg_fk,
     )
     report = {
-        "operation": "prepare_teto_vmd_export",
+        "operation": "prepare_mmd_vmd_export",
         "global_correction_bake": baked,
         "leg_fk_cleanup": cleaned,
         "leg_ik_toggle": leg_ik,
@@ -2377,7 +2324,7 @@ class MD_OT_PrepareVMDExport(Operator):
         layout.label(text="会先确认上肢已烘到普通的“腕 / 肘 / 手首”骨骼，")
         layout.label(text="再恢复肘部层级，并删除只供 Blender 编辑使用的手 IK 骨。")
         layout.separator()
-        layout.label(text="不会修改 PMX，也不会修改原始 Teto 模板。", icon="CHECKMARK")
+        layout.label(text="不会修改 PMX，也不会修改原始 模型 模板。", icon="CHECKMARK")
         layout.label(text="会先创建检查点；丢弃预览即可完整恢复。", icon="LOOP_BACK")
 
     def execute(self, context):
@@ -2859,7 +2806,7 @@ def _silent_root_pivot_fix(context, settings):
     这里只平移 torso_root、让旋转绕 hips 头生效，旋转与脚 IK 都不动。找不到 Rig/动作就跳过，不阻断记录。
     """
     try:
-        rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+        rig = _require_object(settings, "mmr_rig", "ARMATURE")
     except RuntimeError:
         return "（未找到 MMR Rig，未做骨盆支点修正）"
     action = getattr(getattr(rig, "animation_data", None), "action", None)
@@ -2878,13 +2825,13 @@ def _silent_root_pivot_fix(context, settings):
 def _silent_upper_body_fix(context, settings):
     """重定向里程碑时静默把上半身位置对齐源（core_target.fix_upper_body_follow），紧接在骨盆支点修正之后。
 
-    ARP 按世界朝向逐骨映射，但源靠骨盆关节以上 0.23 m 的腰段侧倾来抵消胯摆，Teto 的上半身链从 hips 头才开始、
-    拿的是 Spine2 的朝向，于是胯摆时肩跟着晃（0001-0999 第 151–277 帧：源 0.077 m，Teto 0.149 m）。
+    ARP 按世界朝向逐骨映射，但源靠骨盆关节以上 0.23 m 的腰段侧倾来抵消胯摆，模型 的上半身链从 hips 头才开始、
+    拿的是 Spine2 的朝向，于是胯摆时肩跟着晃（0001-0999 第 151–277 帧：源 0.077 m，模型 0.149 m）。
     这里逐帧绕 hips 头转 spine_fk.001：肩中相对髋中的左右偏移照抄源（1:1，与髋、脚一致），前后偏移按躯干长度比缩放；
     髋、腿、脚和 torso_root 都不动。找不到 Rig/动作/源骨架就跳过，出错也不阻断记录。
     """
     try:
-        rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+        rig = _require_object(settings, "mmr_rig", "ARMATURE")
     except RuntimeError:
         return "（未找到 MMR Rig，未做上半身对齐）"
     action = getattr(getattr(rig, "animation_data", None), "action", None)
@@ -2938,7 +2885,7 @@ def _fix_line(letter, report, applied):
 
 
 def _fix_rig_action(settings):
-    rig = _require_object(settings, "mmr_rig", "ARMATURE", OBJECT_NAMES["mmr_rig"])
+    rig = _require_object(settings, "mmr_rig", "ARMATURE")
     action = getattr(getattr(rig, "animation_data", None), "action", None)
     if action is None:
         raise RuntimeError("MMR Rig 还没有活动 Action（先完成重定向）")
@@ -2985,9 +2932,7 @@ def _target_fix_pelvis_reach(context, settings):
 
     scene = context.scene
     rig, action = _fix_rig_action(settings)
-    armature = _require_object(
-        settings, "mmd_armature", "ARMATURE", OBJECT_NAMES["mmd_armature"]
-    )
+    armature = _require_object(settings, "mmd_armature", "ARMATURE")
     source = getattr(settings, "source_armature", None)
     if source is None:
         raise RuntimeError("未设置源骨架（planted 区间和腿长比重都从它量）")
@@ -3084,7 +3029,7 @@ class MD_OT_TargetFixC(_MD_OT_TargetFix):
     bl_idname = "mocap_doctor.target_fix_c"
     bl_label = "C 骨盆够程"
     bl_description = (
-        "按源骨架的腿长比重逐帧解骨盆高度（写 torso_root）：Teto 的腿比拍摄者长，"
+        "按源骨架的腿长比重逐帧解骨盆高度（写 torso_root）：模型 的腿比拍摄者长，"
         "同一个髋高会让膝盖比源更直、踩实的脚够不到地面。planted 区间读的是源骨架"
         "的检测结果，需要先跑「检测 planted 区间」。"
     )
@@ -3431,7 +3376,7 @@ class MD_OT_ValidateManualMMDBake(Operator):
                     foot_ik["R"],
                 }
                 if not (set(driven_bones) - set(MMD_LEG_FK_BONES) - required_only):
-                    raise RuntimeError("固定 Teto 骨架上没有 MMR 驱动骨，也没有可验证的 MMD Bake 骨骼曲线")
+                    raise RuntimeError("MMD 骨架 骨架上没有 MMR 驱动骨，也没有可验证的 MMD Bake 骨骼曲线")
             _validate_mmd_action(
                 source_action,
                 foot_ik,
@@ -3681,7 +3626,7 @@ class MD_OT_ExportVMD(Operator):
             # directly with the validated MMD Root active instead.
             with _active_armature(context, root, pose=False):
                 if not bpy.ops.mmd_tools.export_vmd.poll():
-                    raise RuntimeError("mmd_tools 未启用，或 Teto 根对象不能导出 VMD")
+                    raise RuntimeError("mmd_tools 未启用，或 模型 根对象不能导出 VMD")
                 result = bpy.ops.mmd_tools.export_vmd(
                     "EXEC_DEFAULT",
                     filepath=str(filepath),
@@ -3734,7 +3679,7 @@ class MD_OT_PrepareReceiverTemplate(Operator):
     def execute(self, context):
         root = self._find_mmd_root(context)
         if root is None:
-            self.report({"ERROR"}, "未找到 MMD 根对象（mmd_type == ROOT）；请打开含 Teto 模型的接收模板")
+            self.report({"ERROR"}, "未找到 MMD 根对象（mmd_type == ROOT）；请打开含 模型 模型的接收模板")
             return {"CANCELLED"}
         armature = self._find_mmd_armature(root)
         if armature is None:

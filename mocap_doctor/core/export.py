@@ -75,7 +75,7 @@ def _matrix_world_is_static(obj: Any) -> bool:
     return True
 
 
-TETO_LEG_FK_BONES = (
+MMD_LEG_FK_BONES = (
     "足.L",
     "ひざ.L",
     "足首.L",
@@ -243,15 +243,15 @@ def remove_bone_animation_curves(
     }
 
 
-def remove_teto_leg_fk_curves(
+def remove_model_leg_fk_curves(
     action: Any,
     *,
-    bone_names: Sequence[str] = TETO_LEG_FK_BONES,
+    bone_names: Sequence[str] = MMD_LEG_FK_BONES,
 ) -> dict[str, Any]:
     """Delete all animation curves for the six FK leg bones."""
 
     result = remove_bone_animation_curves(action, bone_names)
-    result["operation"] = "remove_teto_leg_fk_curves"
+    result["operation"] = "remove_model_leg_fk_curves"
     return result
 
 

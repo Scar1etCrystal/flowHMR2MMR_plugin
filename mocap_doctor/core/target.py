@@ -1,4 +1,4 @@
-"""Validated repairs for the arue Teto model and its MMR control rig."""
+"""Validated repairs for the the model model and its MMR control rig."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ from ..presets import gvhmr_source_prefix  # noqa: F401  (deprecated compat)
 
 DEFAULT_FOOT_IK = {"L": "foot_ik.L", "R": "foot_ik.R"}
 # The MMD ankle bone spans heel to ball of foot, so its head and tail are the
-# closest thing to a sole the fixed Teto skeleton offers for measuring where a
+# closest thing to a sole the fixed 模型 skeleton offers for measuring where a
 # planted foot actually is.  The toe bone is deliberately not used: MMR does not
 # drive it before MMD Visual Bake, so it would report a frozen rest position.
 DEFAULT_GROUND_POINTS = {
@@ -73,7 +73,7 @@ SUSPECT_AIRBORNE_HEIGHT = 0.06
 # Pelvis reach pass (inside foot_lock, before the ankle lock): re-solve the
 # body height per frame so the model keeps the SOURCE's leg reach ratio
 # |hip-ankle| / leg_length - which for a two-bone chain is the knee angle by
-# geometric identity.  Teto's legs are proportionally longer than the capture
+# geometric identity.  the model's legs are proportionally longer than the capture
 # subject's, so retargeted poses straighten the knee beyond the source and
 # lift planted feet off the floor; lowering the torso onto the correct reach
 # restores both.  Written onto torso_root (the bone the retarget actually
@@ -118,11 +118,11 @@ DEFAULT_EXCLUDED_MESH_KEYWORDS = (
 
 # Root pivot (silently applied when the retarget milestone is recorded).  The
 # ARP bmap maps the source pelvis - location AND rotation - onto torso_root,
-# whose head sits at the MMD センター height: on Teto that is ~0.39 m BELOW the
+# whose head sits at the MMD センター height: on the model that is ~0.39 m BELOW the
 # hip joints, while the SMPL-X pelvis joint is ~0.09 m ABOVE them.  The same
 # pelvis tilt about the low pivot swings the hips against their own sway:
 # 0001-0999 frames 151-277 measure 0.19 m of hip sway on the source and 0.07 m
-# (out of phase) on Teto.  The fix keeps every rotation and shifts torso_root so
+# (out of phase) on the model.  The fix keeps every rotation and shifts torso_root so
 # the rotation acts about the hips bone head; child pose = rest + R0 loc +
 # R0 R(q) S d, so loc += d - R(q) S d with d = hips head - torso_root head in
 # torso_root's rest frame.  Foot IK targets are untouched (separate chains).
@@ -220,18 +220,18 @@ def fix_root_pivot(
 # 0001-0999: the offset Rs^T Rt drifts 0.00 deg on all spine/neck/arm pairs),
 # but the chains differ in where the rotations act.  The source counter-leans
 # its hip sway with Pelvis+Spine1 (23 deg peak-to-peak) over 0.23 m of lumbar
-# ABOVE its pelvis joint; on Teto, Spine1's orientation lands on spine_fk, which
+# ABOVE its pelvis joint; on the model, Spine1's orientation lands on spine_fk, which
 # swings the pelvis segment BELOW the hips head, and the upper chain starts AT
 # the hips head with Spine2's orientation (12 deg).  Frames 151-277: source
-# shoulders sway 0.077 m under a 0.191 m hip sway, Teto's 0.149 m.
+# shoulders sway 0.077 m under a 0.191 m hip sway, the model's 0.149 m.
 # The fix swings spine_fk.001 about its head (= hips head; everything above it
-# rides along, the hips and legs do not) so Teto's shoulder-mid sits where the
+# rides along, the hips and legs do not) so the model's shoulder-mid sits where the
 # source puts it relative to the hips-mid: the lateral offset 1:1 - hips and
 # feet are mapped 1:1, so "the shoulders stay put" is absolute - and the
 # forward offset scaled by the torso length ratio, i.e. the source's forward
-# lean angle (absolute would bend Teto's 0.71x torso ~1.4x as far in bows).
+# lean angle (absolute would bend the model's 0.71x torso ~1.4x as far in bows).
 # A lateral target scaled like the forward one measures 0.108 m of shoulder
-# sway instead of 0.087 m: Teto's torso is too short for the angle alone.
+# sway instead of 0.087 m: the model's torso is too short for the angle alone.
 UPPER_BODY_MARK = "mcd_upper_body_follow"
 UPPER_BODY_SWING_BONE = "spine_fk.001"
 UPPER_BODY_RIG_HIPS = ("ORG-thigh.L", "ORG-thigh.R")
@@ -280,13 +280,13 @@ def upper_body_swing(
 ) -> dict[str, Any]:
     """Per-frame world swing about ``pivot`` that puts the shoulders where the source has them.
 
-    Inputs are (F, 3) world positions per frame: Teto's swing-bone head
+    Inputs are (F, 3) world positions per frame: the model's swing-bone head
     (``pivot``), shoulder-mid and hip joints; the source's shoulder-mid and hip
     joints.  Each skeleton gets its own horizontal lateral axis (its hip line)
     and forward axis (up x lateral).  The target offset of the shoulder-mid
     from the hips-mid is the source's lateral component times
     ``lateral_scale`` and its forward component times ``torso_ratio``
-    (Teto/source hips-mid -> shoulder-mid length, measured when None); the
+    (模型/source hips-mid -> shoulder-mid length, measured when None); the
     vertical follows from keeping the shoulder-mid's distance to the pivot.
     The minimal rotation is smoothed (Gaussian, frames), faded out where the
     source torso leans past ``upright_fade_deg``, zeroed where a hip line is
@@ -429,7 +429,7 @@ def fix_upper_body_follow(
 ) -> dict[str, Any]:
     """Swing the retarget's upper spine so the shoulders follow the source's position.
 
-    Samples every keyed frame of ``swing_bone`` (Teto and source evaluated
+    Samples every keyed frame of ``swing_bone`` (模型 and source evaluated
     together), computes ``upper_body_swing`` and writes it into the swing
     bone's quaternion keys as a world rotation about its head:
     q' = q (Rw^T Q Rw).  Only those four curves change; the hips, legs, feet
@@ -568,7 +568,7 @@ def fix_upper_body_follow(
 
 
 def ensure_global_correction_empty(
-    name: str = "teto_global_correction",
+    name: str = "model_global_correction",
     *,
     collection: Any | None = None,
 ) -> Any:
@@ -600,7 +600,7 @@ def apply_global_correction(
     *,
     rotation_degrees: Sequence[float] = (-4.2, 3.7, 0.0),
 ) -> dict[str, Any]:
-    """Parent Teto and MMR under one Empty, then apply the tested correction."""
+    """Parent 模型 and MMR under one Empty, then apply the tested correction."""
 
     if len(rotation_degrees) != 3:
         raise ValueError("rotation_degrees must contain X, Y, and Z")
@@ -620,7 +620,7 @@ def apply_global_correction(
     correction.rotation_mode = "XYZ"
     correction.rotation_euler = radians
     return {
-        "operation": "apply_teto_global_correction",
+        "operation": "apply_model_global_correction",
         "model_root": model_root.name,
         "rig": rig.name,
         "correction": correction.name,
@@ -794,7 +794,7 @@ def damp_foot_ik_tilt(
             ),
         )
     return {
-        "operation": "damp_teto_foot_ik_tilt",
+        "operation": "damp_model_foot_ik_tilt",
         "frame_range": [start, end],
         "reference_frame": reference,
         "strength": strength,
@@ -957,7 +957,7 @@ def repair_mesh_floor_lift_v3_safe(
     excluded_keywords: Sequence[str] = DEFAULT_EXCLUDED_MESH_KEYWORDS,
     worst_sample_limit: int = 100,
 ) -> dict[str, Any]:
-    """Scan evaluated Teto meshes and add a non-accumulating correction Z."""
+    """Scan evaluated 模型 meshes and add a non-accumulating correction Z."""
 
     start, end = resolve_frame_range(scene, frame_start, frame_end)
     meshes = collect_target_meshes(
@@ -966,7 +966,7 @@ def repair_mesh_floor_lift_v3_safe(
         excluded_keywords=excluded_keywords,
     )
     if not meshes:
-        raise RuntimeError("no target meshes were found under the Teto root")
+        raise RuntimeError("no target meshes were found under the 模型 root")
 
     existing_action = get_action(correction, required=False)
     if action is not None and existing_action is not action:
@@ -987,7 +987,7 @@ def repair_mesh_floor_lift_v3_safe(
     # 给出的 Z 就是 original_z[frame]，求值状态与原来第二遍逐位相同；旧曲线在
     # 循环后再删。省掉 1499 次整场景求值。
     # P2：之后保留的"把同一个值显式设回去 + view_layer.update()"也去掉——值没变，
-    # 只是逼整棵子树（Teto 网格）每帧再算一遍（bench 摘要逐位相同）。
+    # 只是逼整棵子树（模型 网格）每帧再算一遍（bench 摘要逐位相同）。
     minimum_by_frame: dict[int, float | None] = {}
     mesh_by_frame: dict[int, str | None] = {}
     with preserve_scene_frame(scene, view_layer):
@@ -1059,7 +1059,7 @@ def repair_mesh_floor_lift_v3_safe(
     z_curve.update()
     worst.sort(key=lambda item: item["penetration"], reverse=True)
     return {
-        "operation": "repair_teto_mesh_floor_lift_v3_safe",
+        "operation": "repair_model_mesh_floor_lift_v3_safe",
         "frame_range": [start, end],
         "mesh_count": len(meshes),
         "meshes": [mesh.name for mesh in meshes],
@@ -1180,8 +1180,8 @@ def analyze_foot_ik_drift(
     for side in ("L", "R"):
         results[side].sort(key=lambda item: item["max_drift_xy_m"], reverse=True)
     return {
-        "schema_version": "teto_foot_ik_drift_v2",
-        "operation": "analyze_teto_foot_ik_drift",
+        "schema_version": "model_foot_ik_drift_v2",
+        "operation": "analyze_model_foot_ik_drift",
         "rig": rig.name,
         "frame_range": [start, end],
         "params": {
@@ -1382,7 +1382,7 @@ def lock_foot_ik_xy(
 
     update_action(action)
     return {
-        "operation": "lock_teto_foot_ik_xy",
+        "operation": "lock_model_foot_ik_xy",
         "frame_range": [start, end],
         "params": {
             "trim_segment_ends": int(trim_segment_ends),
@@ -1514,7 +1514,7 @@ def _settle_pelvis_for_reach(
 
     For a two-bone leg chain the ratio |hip-ankle| / (thigh+shin) determines
     the knee angle exactly, so holding the model's ratio equal to the source
-    skeleton's preserves the captured knee bend.  Teto's legs are
+    skeleton's preserves the captured knee bend.  the model's legs are
     proportionally longer than the capture subject's: the same retargeted hip
     height leaves the model's knee straighter than intended and - inside
     planted spans - physically unable to reach the floor.  Rather than only
@@ -1937,7 +1937,7 @@ def settle_pelvis_for_reach(
     """Standalone entry to the pelvis reach solve (the wizard's C button).
 
     ``stabilize_planted_feet`` runs this pass inside the foot-lock chain.  The
-    reach problem it fixes - Teto's legs are proportionally longer than the
+    reach problem it fixes - the model's legs are proportionally longer than the
     capture subject's, so a retargeted hip height leaves the knee straighter
     than the source and planted feet saturate at leg extension - is already
     visible right after the retarget, so the user decision (Q15) is that the
@@ -2936,7 +2936,7 @@ def model_sole_offset(
     """How far the pinned bone rests above the model's sole in its bind pose.
 
     A PMX model is built standing on the ground, so the ankle's bind height IS
-    the ankle-to-sole drop - measured on arue Teto as 5.6 cm (ankle sample at
+    the ankle-to-sole drop - measured on the model as 5.6 cm (ankle sample at
     +5.3 cm, sole's lowest vertex at -0.3 cm).  Pinning the ankle to the floor
     without this offset buries the shoe by that much; the old pipeline hid the
     problem behind a hand tuned 2.57 cm default, this reads it off the model
@@ -3245,7 +3245,7 @@ def ground_feet_outside_airborne(
     ]
 
     return {
-        "operation": "ground_teto_feet_outside_airborne",
+        "operation": "ground_model_feet_outside_airborne",
         "frame_range": [start, end],
         "sample_armature": sample_armature.name,
         "move_object": move_object.name,
