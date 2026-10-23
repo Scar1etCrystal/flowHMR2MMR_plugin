@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "mocap_doctor"
-version = "1.23.2"
+version = "1.23.3"
 name = "MoCap Doctor"
 tagline = "Guided mocap cleanup and MMD VMD export"
 maintainer = "MoCap Doctor contributors"

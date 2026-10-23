@@ -68,6 +68,32 @@ def _blend_pose(poses, weight):
     return Matrix.LocRotScale(first.translation, rotation, first.to_scale())
 
 
+def _translation_anchor(scene, source, bones, frames, source_matrix_world, layer):
+    """Pick the frame where the feet are lowest; that is the ground-contact pose.
+
+    Using the first frame as the translation baseline breaks whenever the clip
+    starts crouched (standing up would lift the whole result).  Anchoring on the
+    lowest-foot frame grounds the clip instead: squat->stand and jump clips both
+    keep the planted foot at the target's own ground level.
+    """
+
+    foot_joints = [joint for joint in ('L_Foot', 'R_Foot', 'L_Ankle', 'R_Ankle')
+                   if joint in bones and joint in source.pose.bones]
+    pelvis_joints = [joint for joint in bones if joint == 'Pelvis'] or list(bones)[:1]
+    step = max(1, len(frames) // 120)
+    best_frame, best_height = frames[0], None
+    for frame in frames[::step]:
+        set_scene_frame(scene, frame, layer)
+        height = min((source_matrix_world @ source.pose.bones[joint].head).z
+                     for joint in foot_joints) if foot_joints else 0.0
+        if best_height is None or height < best_height:
+            best_frame, best_height = frame, height
+    set_scene_frame(scene, best_frame, layer)
+    anchor = {joint: source_matrix_world @ source.pose.bones[joint].matrix
+              for joint in pelvis_joints}
+    return best_frame, anchor
+
+
 def _body_scale(source, target, source_rest_world, target_rest_world):
     """World height ratio; source and target armatures have different object scales."""
 
@@ -321,15 +347,11 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
     max_leg_error = 0.0
     twist_frames = 0
 
+    anchor_frame = frames[0]
+    source_baseline: dict[str, Matrix] = {}
     with preserve_scene_frame(scene, layer):
-        # 位移基准 = 源动画首帧，而不是骨架 rest：
-        # 源 FBX 的 rest 骨盆在 z=-0.25m，动画却在 z=0.95m，用 rest 当零点
-        # 会凭空多出 1.2m 位移（实测整个人被抬高 2.5m）。
-        set_scene_frame(scene, frames[0], layer)
-        source_baseline = {
-            joint: source_matrix_world @ source.pose.bones[joint].matrix
-            for joint in bones
-        }
+        anchor_frame, source_baseline = _translation_anchor(
+            scene, source, bones, frames, source_matrix_world, layer)
         for index, frame in enumerate(frames):
             set_scene_frame(scene, frame, layer)
             if index % 200 == 0:
@@ -359,10 +381,13 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
                                        @ target_rest_pose.to_quaternion())
                     rotations.append(pose_s.to_quaternion() @ offset_rotation)
                     if translation is None:
-                        baseline = source_baseline[joint]
-                        translation = (target_rest_pose.translation
-                                       + body_scale * (pose_s.translation
-                                                       - baseline.translation))
+                        baseline = source_baseline.get(joint)
+                        if baseline is not None:
+                            translation = (target_rest_pose.translation
+                                           + body_scale * (pose_s.translation
+                                                           - baseline.translation))
+                        else:
+                            translation = target_rest_pose.translation
                 if not rotations or translation is None:
                     continue
                 rotation = rotations[0]
@@ -466,6 +491,7 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
         'muted_constraints': [f'{bone}:{con}' for bone, con in muted],
         'spine_merge_weight': spine_weight,
         'body_scale': round(body_scale, 6),
+        'translation_anchor_frame': anchor_frame,
         'joint_angle_correction': True,
         'leg_ankle_fix_max_error_m': round(max_leg_error, 6),
         'twist_split_frames': twist_frames,
