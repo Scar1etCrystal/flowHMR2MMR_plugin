@@ -35,7 +35,8 @@ from .mmd_fk_map import (BONE_TABLE, build_lookup, mute_blocking_constraints,
                          resolve)
 
 SPINE_MERGE_WEIGHT = 0.5
-TRANSLATION_ONLY = ("センター",)
+ROOT_BONE = "センター"          # 源 Pelvis = 根部（位移 + 整体旋转）
+WRITE_EXCLUDE = {"下半身"}      # 根部职责归 センター，下半身保持静止
 ANGLE_FIX_EPS = math.radians(0.02)
 TWIST_SHARE = 0.5          # 前臂/手腕扭转分配给 腕捩/手捩 的比例
 LEG_SIDES = ('L', 'R')
@@ -330,6 +331,8 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
                                  for joint in bones}
             desired: dict[str, Matrix] = {}
             for japanese, joints in grouped.items():
+                if japanese in WRITE_EXCLUDE:
+                    continue
                 pose_bone = next((bones[j] for j in joints if j in bones), None)
                 if pose_bone is None:
                     continue
@@ -341,8 +344,12 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
                         continue
                     rest_s = source_rest_world[joint]
                     pose_s = source_pose_world[joint]
-                    delta = rest_s.inverted() @ pose_s
-                    rotations.append(target_rest_pose.to_quaternion() @ delta.to_quaternion())
+                    # 正确的 rest 相对搬运：S_pose @ (S_rest^-1 T_rest)。
+                    # 直接套 T_rest @ (S_rest^-1 S_pose) 会丢共轭项，源骨轴会被
+                    # 当成目标骨轴，姿态整体错乱（实测四肢乱飞）。
+                    offset_rotation = (rest_s.to_quaternion().inverted()
+                                       @ target_rest_pose.to_quaternion())
+                    rotations.append(pose_s.to_quaternion() @ offset_rotation)
                     if translation is None:
                         translation = (target_rest_pose.translation
                                        + body_scale * (pose_s.translation - rest_s.translation))
@@ -359,8 +366,7 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
                 source_pose_world, source_rest_world, target_rest_world)
             final: dict[str, Matrix] = {}
             for name, pose in desired.items():
-                rotation = (Quaternion((1, 0, 0, 0)) if name in TRANSLATION_ONLY
-                            else corrected[name])
+                rotation = corrected[name]
                 final[name] = Matrix.LocRotScale(pose.translation, rotation,
                                                  pose.to_scale())
 
@@ -387,10 +393,9 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
                     rest_parent = target_rest[parent.name]
                 basis = _basis_from_desired(target_pose, parent_pose, rest_parent,
                                             target_rest[name])
-                translation_only = name in TRANSLATION_ONLY
-                location = basis.translation.copy() if translation_only else None
-                rotation = (Quaternion((1, 0, 0, 0)) if translation_only
-                            else basis.to_quaternion())
+                write_location = name == ROOT_BONE
+                location = basis.translation.copy() if write_location else None
+                rotation = basis.to_quaternion()
                 pose_bone = target.pose.bones[name]
                 if pose_bone.rotation_mode == 'QUATERNION':
                     pose_bone.rotation_quaternion = rotation
@@ -399,12 +404,11 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
                 else:
                     pose_bone.rotation_euler = rotation.to_euler(pose_bone.rotation_mode)
                     pose_bone.keyframe_insert('rotation_euler', frame=frame, group=name)
-                if translation_only:
+                if write_location:
                     pose_bone.location = location
                     pose_bone.keyframe_insert('location', frame=frame, group=name)
-                wanted_rotation.setdefault(name, {})[frame] = rotation.copy()
-                if translation_only:
                     wanted_location.setdefault(name, {})[frame] = location.copy()
+                wanted_rotation.setdefault(name, {})[frame] = rotation.copy()
 
     set_linear_for_paths(action, {curve.data_path for curve in action.fcurves})
     update_action(action)
