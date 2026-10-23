@@ -511,6 +511,15 @@ class MD_PG_ProjectSettings(PropertyGroup):
         ),
         default="AUTO",
     )
+    # 重定向路线：MMR 走 Auto-Rig Pro 重映射；MMD 直接解算到原生 MMD FK。
+    retarget_route: EnumProperty(
+        name="路线",
+        items=(
+            ("MMR", "FlowHMR->MMR", "经 Auto-Rig Pro 重映射到 MMR 骨架，再由约束驱动 MMD"),
+            ("MMD", "FlowHMR->MMD", "直接解算到原生 MMD 骨架 FK（不经 MMR，不需要 ARP）"),
+        ),
+        default="MMR",
+    )
     # 重定向映射：内置 FlowHMR 映射，或自定义 .bmap 文件。
     retarget_bmap_choice: EnumProperty(
         name="映射",

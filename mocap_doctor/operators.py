@@ -1998,9 +1998,40 @@ def _retarget_objects(settings):
     return source, target
 
 
+def _run_retarget_mmd_fk(context, settings):
+    """Direct FlowHMR -> native MMD FK retarget (no MMR, no ARP)."""
+
+    from .core import mmd_fk
+
+    scene = context.scene
+    source = settings.source_armature
+    target = settings.mmd_armature
+    if source is None or source.type != 'ARMATURE':
+        raise RuntimeError('请选择源骨架')
+    if target is None or target.type != 'ARMATURE':
+        raise RuntimeError('请选择 MMD 骨架')
+    if source == target:
+        raise RuntimeError('源骨架与 MMD 骨架不能相同')
+    _require_restore_before_rerun(scene, 'retarget')
+    _ensure_no_pending_preview(settings)
+    _begin_structure_preview(scene, 'retarget')
+    report = mmd_fk.retarget_to_mmd_fk(
+        scene, source, target,
+        frame_start=settings.mocap_frame_start,
+        frame_end=settings.mocap_frame_end)
+    _record_report(scene, 'retarget', report, 'PREVIEW', 'MMD FK 重定向预览已生成')
+    settings.retarget_status = ''
+    settings.status_level = 'INFO'
+    return ('MMD FK 重定向预览已生成（%d 根骨，写入校验 %.2f）'
+            % (report['bones_written'], report['max_pose_error_deg']))
+
+
 def _run_retarget(context, settings):
     """Create a structural preview: ARP changes both rigs, not just one Action."""
     from .core import flowhmr_retarget as RT
+
+    if getattr(settings, 'retarget_route', 'MMR') == 'MMD':
+        return _run_retarget_mmd_fk(context, settings)
 
     scene = context.scene
     source, target = _retarget_objects(settings)

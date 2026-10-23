@@ -348,14 +348,17 @@ class MD_PT_Main(Panel):
         elif step_id == "retarget":
             layout.prop(settings, "retarget_mode", text="模式")
             if settings.retarget_mode == "AUTO":
-                layout.prop(settings, "source_armature", text="源骨架")
-                layout.prop(settings, "mmr_rig", text="目标骨架")
-                layout.prop(settings, "retarget_bmap_choice", text="映射")
-                if settings.retarget_bmap_choice == "CUSTOM":
-                    layout.prop(settings, "retarget_bmap_custom", text="映射文件")
-                layout.prop(settings, "retarget_preset", text="rest 预设")
-                layout.operator("mocap_doctor.save_rest_preset",
-                                text="保存 rest 预设", icon="PRESET")
+                layout.prop(settings, "retarget_route", text="路线")
+                if getattr(settings, "retarget_route", "MMR") == "MMD":
+                    layout.prop(settings, "source_armature", text="源骨架")
+                    layout.prop(settings, "mmd_armature", text="MMD 骨架")
+                else:
+                    layout.prop(settings, "source_armature", text="源骨架")
+                    layout.prop(settings, "mmr_rig", text="目标骨架")
+                    layout.prop(settings, "retarget_bmap_choice", text="映射")
+                    if settings.retarget_bmap_choice == "CUSTOM":
+                        layout.prop(settings, "retarget_bmap_custom", text="映射文件")
+                    layout.prop(settings, "retarget_preset", text="rest 预设")
                 _draw_run(layout, step_id, "重定向", "MOD_ARMATURE")
             else:
                 # 手动模式：插件不介入，只等你在外面做完。
