@@ -322,6 +322,14 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
     twist_frames = 0
 
     with preserve_scene_frame(scene, layer):
+        # 位移基准 = 源动画首帧，而不是骨架 rest：
+        # 源 FBX 的 rest 骨盆在 z=-0.25m，动画却在 z=0.95m，用 rest 当零点
+        # 会凭空多出 1.2m 位移（实测整个人被抬高 2.5m）。
+        set_scene_frame(scene, frames[0], layer)
+        source_baseline = {
+            joint: source_matrix_world @ source.pose.bones[joint].matrix
+            for joint in bones
+        }
         for index, frame in enumerate(frames):
             set_scene_frame(scene, frame, layer)
             if index % 200 == 0:
@@ -351,8 +359,10 @@ def retarget_to_mmd_fk(scene, source, target, *, frame_start, frame_end,
                                        @ target_rest_pose.to_quaternion())
                     rotations.append(pose_s.to_quaternion() @ offset_rotation)
                     if translation is None:
+                        baseline = source_baseline[joint]
                         translation = (target_rest_pose.translation
-                                       + body_scale * (pose_s.translation - rest_s.translation))
+                                       + body_scale * (pose_s.translation
+                                                       - baseline.translation))
                 if not rotations or translation is None:
                     continue
                 rotation = rotations[0]
