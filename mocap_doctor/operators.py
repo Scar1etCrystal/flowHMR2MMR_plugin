@@ -833,7 +833,8 @@ def _curve_covers_frame_range(curve, frame_start, frame_end):
     return bool(frames) and min(frames) <= float(frame_start) + 0.001 and max(frames) >= float(frame_end) - 0.001
 
 
-def _bone_has_complete_arm_animation(action, pose_bone, frame_start, frame_end):
+def _bone_has_complete_arm_animation(action, pose_bone, frame_start, frame_end,
+                                     require_location=True):
     bone_name = pose_bone.name
     prefix = f'pose.bones["{bone_name}"]'
 
@@ -854,6 +855,8 @@ def _bone_has_complete_arm_animation(action, pose_bone, frame_start, frame_end):
         "AXIS_ANGLE": ("rotation_axis_angle", range(4)),
     }.get(pose_bone.rotation_mode, ("rotation_euler", range(3)))
     rotation_complete = complete(rotation_path, rotation_indices)
+    if not require_location:
+        return rotation_complete
     return complete("location", range(3)) and rotation_complete
 
 
@@ -886,15 +889,21 @@ def _maximum_matrix_sample_error(before, after):
     return maximum
 
 
-def _require_complete_arm_fk_animation(action, armature, frame_start, frame_end):
-    """Require complete transform channels across the six physical arm bones."""
+def _require_complete_arm_fk_animation(action, armature, frame_start, frame_end,
+                                       require_location=True):
+    """Require complete transform channels across the six physical arm bones.
+
+    ``require_location=False`` 只校验旋转：纯 FK 归一化会把除 センター 以外的
+    位置曲线全部删掉（手臂位移合并进根位移），此时手臂本来就不该有 location 通道。
+    """
 
     missing = []
     for bone_name in MMD_ARM_FK_BONES:
         pose_bone = armature.pose.bones.get(bone_name)
         if pose_bone is None:
             missing.append(f"{bone_name}（骨骼不存在）")
-        elif not _bone_has_complete_arm_animation(action, pose_bone, frame_start, frame_end):
+        elif not _bone_has_complete_arm_animation(action, pose_bone, frame_start, frame_end,
+                                                  require_location):
             missing.append(bone_name)
     if missing:
         raise RuntimeError("上肢 Bake 不完整，不能导出 VMD：" + ", ".join(missing))
@@ -1082,7 +1091,9 @@ def _prepare_mmd_mmr_hand_export_cleanup(
 
     # MMD Bake already creates the physical arm keys. Re-baking here can
     # overwrite a valid manual Bake under MMR's altered elbow hierarchy.
-    _require_complete_arm_fk_animation(action, armature, frame_start, frame_end)
+    # 只要求旋转：烘焙阶段已经做过纯 FK 归一化，手臂位置被合并进 センター 了。
+    _require_complete_arm_fk_animation(action, armature, frame_start, frame_end,
+                                       require_location=False)
     arm_bake = {
         "operation": "validated_existing_arm_fk_bake",
         "bones": list(MMD_ARM_FK_BONES),
@@ -1801,6 +1812,16 @@ def _run_export_prep(context, settings):
             frame_end=settings.mocap_frame_end,
             reset_correction=True,
         )
+    # 顺序很重要：手部清理要求六根手臂骨「位置 + 旋转」齐全（它是按烘焙结果
+    # 判断上肢是否完整的），而 normalize_to_pure_fk 会把除 センター 以外的位置
+    # 曲线全部删掉。先清理、后归一，否则必然报「上肢 Bake 不完整」。
+    hand_export_cleanup = _prepare_mmd_mmr_hand_export_cleanup(
+        scene,
+        armature,
+        action,
+        settings.mocap_frame_start,
+        settings.mocap_frame_end,
+    )
     from .core import fk_export
     pure_fk = fk_export.normalize_to_pure_fk(
         scene, armature, action,
@@ -1814,15 +1835,8 @@ def _run_export_prep(context, settings):
     leg_ik = {
         "operation": "key_ik_toggle_state",
         "skipped": True,
-        "reason": "纯 FK 导出：不写 IK 开关",
+        "reason": "纯 FK 导出：IK 开关由纯 FK 归一化写入（关闭足ＩＫ / つま先ＩＫ）",
     }
-    hand_export_cleanup = _prepare_mmd_mmr_hand_export_cleanup(
-        scene,
-        armature,
-        action,
-        settings.mocap_frame_start,
-        settings.mocap_frame_end,
-    )
     _require_no_keyed_vmd_name_collisions(armature, action)
     offset = core_export.apply_vmd_floor_z_offset(
         scene,
