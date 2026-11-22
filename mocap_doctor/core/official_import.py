@@ -15,17 +15,16 @@
   导入时由 :mod:`mocap_doctor.core.source_naming` 一次性改成 FlowHMR 原生名
   （``Pelvis`` / ``L_Hip`` / ``L_Index1`` …，骨骼 + 顶点组 + 曲线路径三处同步）。
   下游（bmap 源骨名、脚部几何检测、FIX A/B/C、手/脚间距）只看原生名。
-* npz **没有** ``foot_contacts``，所以贴地区间由骨架几何推断
-  （``CONTACT_GEOMETRY``）；有分数时（老文件）仍然优先用分数（``CONTACT_TAKE``）。
+* 接触分数（``foot_contacts``，(T,4)，通道 ``left_ankle / left_toe /
+  right_ankle / right_toe``）有两种新格式位置，按优先级认：
 
-接触分数取值顺序——只有两档，**显式、可见**：
+  1. ``CONTACT_MANUAL``   面板手填的 npz；
+  2. ``CONTACT_NPZ``      主体 npz 自带 ``foot_contacts``（``web_jobs/motion.npz`` 那种）；
+  3. ``CONTACT_SIDECAR``  同目录的 ``<name>_foot_contacts.npz`` 旁路文件；
+  4. ``CONTACT_GEOMETRY`` 都没有 → 回退骨架几何检测，状态行注明。
 
-1. ``CONTACT_TAKE``      目录里存在带 ``foot_contacts`` 的 body npz → 用它；
-2. ``CONTACT_GEOMETRY``  没有 → 回退几何检测，状态行注明。
-
-（历史分支「同 take 临时官方 npz ``F:\\flowhmr_official_out``」已删除：它按 take
-token 做前缀匹配，``t1`` 会命中 ``t1499_OFFICIAL_nopost.npz`` 这类无关文件，
-把别的动作的接触数据静默套到当前 take 上。）
+  旁路文件若带 ``frame_start``，会换算成 ``npz_frame_offset``（约定
+  ``blender_frame = npz_index + npz_frame_offset``）。
 
 视频平面（``MCD_reference_video``）仅在目录里存在 mp4 时创建；变换规格不变：
 绕 Z 轴 −90° → 沿 +Y 平移 1.0 m → 放大 ×1.5 → 先缩放再把底边对齐地面。
@@ -38,6 +37,8 @@ from __future__ import annotations
 import os
 from typing import Any, Sequence
 
+import numpy as np
+
 # --- 主布局（take 目录）的文件名约定 ---------------------------------------
 TAKE_FBX_NAMES = ("final.fbx",)
 # 正规 take 目录现在有三份 body npz（用户 2026-10-16 说明，字段完全一致、都带 foot_contacts）：
@@ -46,12 +47,16 @@ TAKE_FBX_NAMES = ("final.fbx",)
 #   final.npz            后处理结果再替换 30 个手指关节（HaMeR 合并）= 该 take 的最终动作
 # 默认选 final.npz（FBX 对应的那一份）。三份 foot_contacts 实测逐比特相同 → 选择不影响
 # planted；万一不一致则回落到 body_postprocess.npz（官方第 5 步语义输入），见
-# :func:`contacts_consistency` / :func:`resolve_body_npz`。
-BODY_NPZ_NAMES = ("final.npz", "body_postprocess.npz", "body_origin.npz")
-DEFAULT_BODY_NPZ = "final.npz"
-OFFICIAL_STEP5_NPZ = "body_postprocess.npz"
-TAKE_NPZ_PREFERRED = BODY_NPZ_NAMES
-NPZ_CHOICE_AUTO = "AUTO"
+# :func:`find_contacts`。
+# 新格式（2026-11 起）只有一支 ``PREVIEW <name>_flowhmr.npz``，接触分数要么直接
+# 存在这支 npz 里，要么单独一支 ``<name>_foot_contacts.npz``。旧的
+# final / body_postprocess / body_origin 三份 npz 及其一致性校验已删除（破坏性）。
+BODY_NPZ_HINT = "flowhmr"
+CONTACTS_NPZ_MARK = "foot_contacts"
+NPZ_SIDECAR_MARKS = (
+    "foot_contacts", "bbox", "camera", "joints", "sam3d", "main_track",
+    "sam_mean_components", "input_",
+)
 TAKE_VIDEO_NAMES = ("working_30fps.mp4",)
 
 # --- 视频平面默认值/理由 ---------------------------------------------------
@@ -63,8 +68,11 @@ DEFAULT_PLANE_HEIGHT_M = 1.60      # 缩放**前**的基准高度 ≈ 模型 身
 PLANE_OBJECT_NAME = "MCD_reference_video"
 PLANE_MATERIAL_NAME = "MCD_reference_video_mat"
 
-CONTACT_TAKE = "TAKE"
-CONTACT_GEOMETRY = "GEOMETRY"
+CONTACT_TAKE = "TAKE"          # 保留给下游既有判断：有分数（任意来源）
+CONTACT_GEOMETRY = "GEOMETRY"  # 没有分数 → 几何推断
+CONTACT_NPZ = "NPZ"            # 分数在主 npz 里
+CONTACT_SIDECAR = "SIDECAR"    # 分数在同目录旁路文件里
+CONTACT_MANUAL = "MANUAL"      # 面板手填
 
 TAKE_DIR_HINT = (
     r"F:\T1  （内含 PREVIEW <name>_flowhmr_skin_t_pose.fbx + PREVIEW <name>_flowhmr.npz；"
@@ -129,17 +137,13 @@ def is_body_npz(path: str) -> bool:
     return "poses" in keys or "trans" in keys
 
 
-def pick_npz(take_dir: str, preferred: Sequence[str] = TAKE_NPZ_PREFERRED) -> str:
-    """take 目录里的 body npz：``body_postprocess.npz`` → ``final.npz`` → 其它带 poses 的顶层 npz。
+def pick_npz(take_dir: str) -> str:
+    """take 目录里的 body npz：优先名字带 ``flowhmr`` 的那支，跳过旁路文件。
 
-    刻意**不**退到任意 npz：``camera.npz`` / ``main_track.npz`` /
-    ``sam_mean_components.npz`` 都不是 body 结果，误当配对会让面板显示 0 帧。
+    ``*_foot_contacts.npz`` / bbox / camera / joints 这类不是 body 结果，
+    文件名先排掉，再按 `is_body_npz` 确认真的带 poses。
     """
 
-    for name in preferred:
-        cand = os.path.join(take_dir, name)
-        if os.path.isfile(cand):
-            return cand
     try:
         entries = sorted(
             entry for entry in os.listdir(take_dir)
@@ -147,10 +151,10 @@ def pick_npz(take_dir: str, preferred: Sequence[str] = TAKE_NPZ_PREFERRED) -> st
         )
     except OSError:
         return ""
-    # 首选名字里带 flowhmr 的（新格式 ``PREVIEW <name>_flowhmr.npz``），
-    # 其余按字母序挑第一个真的是 body 结果的，避免抓到 bbox / camera 这类旁路文件。
-    ordered = sorted(entries, key=lambda name: (0 if "flowhmr" in name.lower() else 1, name))
+    ordered = sorted(entries, key=lambda name: (0 if BODY_NPZ_HINT in name.lower() else 1, name))
     for entry in ordered:
+        if any(mark in entry.lower() for mark in NPZ_SIDECAR_MARKS):
+            continue
         cand = os.path.join(take_dir, entry)
         if is_body_npz(cand):
             return cand
@@ -245,222 +249,85 @@ def load_foot_contacts(path: str) -> Any:
         return None
 
 
-def take_body_npz(take_dir: str) -> dict[str, str]:
-    """take 目录里存在的三份标准 body npz：``{文件名: 路径}``（按偏好顺序）。"""
+def pick_contacts_npz(take_dir: str) -> dict[str, Any]:
+    """旁路接触文件 ``<name>_foot_contacts.npz``。"""
 
-    out: dict[str, str] = {}
-    if not take_dir or not os.path.isdir(take_dir):
-        return out
-    for name in BODY_NPZ_NAMES:
-        cand = os.path.join(take_dir, name)
-        if os.path.isfile(cand):
-            out[name] = cand
-    return out
-
-
-def contacts_consistency(take_dir: str) -> dict[str, Any]:
-    """三份 npz 的 ``foot_contacts`` 是否一致（运行时校验，写进状态行）。
-
-    一致 → 选哪份都不影响 planted；不一致 → 默认改用 ``body_postprocess.npz``
-    （官方第 5 步的语义输入）并说明差异。校验只读、逐比特比较（float32 精确相等）。
-    """
-
-    import numpy as np
-
-    result: dict[str, Any] = {
-        "present": take_body_npz(take_dir),
-        "with_contacts": [],
-        "equal": None,
-        "max_diff": 0.0,
-        "diff_frames": 0,
-        "reference": "",
-        "same_shape": True,
-        "status": "",
-    }
-    arrays: dict[str, Any] = {}
-    for name, path in result["present"].items():
-        fc = load_foot_contacts(path)
-        if fc is not None:
-            arrays[name] = fc
-            result["with_contacts"].append(name)
-    if len(arrays) < 2:
-        return result
-    reference = OFFICIAL_STEP5_NPZ if OFFICIAL_STEP5_NPZ in arrays else result["with_contacts"][0]
-    result["reference"] = reference
-    ref = arrays[reference]
-    for name, arr in arrays.items():
-        if arr.shape != ref.shape:
-            result["same_shape"] = False
-            result["equal"] = False
-            result["status"] = (
-                f"**三份接触分数形状不一致**（{name} {arr.shape} vs {reference} {ref.shape}）"
-                f" → 默认改用官方第 5 步语义输入 {reference}"
-            )
-            return result
-    max_diff = 0.0
-    diff_frames = 0
-    for name, arr in arrays.items():
-        diff = np.abs(arr - ref)
-        max_diff = max(max_diff, float(diff.max()) if diff.size else 0.0)
-        diff_frames = max(diff_frames, int((diff.max(axis=1) > 0).sum()) if diff.size else 0)
-    result["max_diff"] = max_diff
-    result["diff_frames"] = diff_frames
-    result["equal"] = max_diff == 0.0
-    names = "/".join(result["with_contacts"])
-    if result["equal"]:
-        result["status"] = f"三份（{names}）接触分数逐比特相同，选择不影响 planted"
-    else:
-        result["status"] = (
-            f"**三份接触分数不一致**（{names} 最大差 {max_diff:.3g}，{diff_frames} 帧不同）"
-            f" → 默认改用官方第 5 步语义输入 {reference}"
+    try:
+        entries = sorted(
+            entry for entry in os.listdir(take_dir)
+            if entry.lower().endswith(".npz")
         )
-    return result
+    except OSError:
+        return {}
+    for entry in entries:
+        if CONTACTS_NPZ_MARK not in entry.lower():
+            continue
+        cand = os.path.join(take_dir, entry)
+        if not npz_has_foot_contacts(cand):
+            continue
+        frame_start, fps, channels = 0, 0.0, []
+        try:
+            with np.load(cand, allow_pickle=True) as data:
+                if "frame_start" in data.files:
+                    frame_start = int(np.asarray(data["frame_start"]).reshape(-1)[0])
+                if "fps" in data.files:
+                    fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+                if "channels" in data.files:
+                    channels = [str(item) for item in np.asarray(data["channels"]).reshape(-1)]
+        except Exception:  # noqa: BLE001 - 元数据读不了不影响分数本身
+            pass
+        return {"path": cand, "frame_start": frame_start, "fps": fps, "channels": channels}
+    return {}
 
 
-def resolve_body_npz(take_dir: str, choice: str = NPZ_CHOICE_AUTO) -> dict[str, Any]:
-    """按选择器/一致性校验决定用哪份 body npz。
+def find_contacts(take_dir: str, *, explicit: str = "") -> dict[str, Any]:
+    """接触分数来源：手填 > 主 npz 自带 > 旁路 ``*_foot_contacts.npz`` > 无（几何推断）。
 
-    返回 ``{"name", "path", "frames", "reason", "consistency", "switched"}``。
-    ``choice`` = ``AUTO`` 或三个标准文件名之一（选了目录里没有的 → 退回 AUTO 并说明）。
-    """
-
-    present = take_body_npz(take_dir)
-    consistency = contacts_consistency(take_dir)
-    with_contacts = consistency["with_contacts"]
-    choice = str(choice or NPZ_CHOICE_AUTO)
-    reason = ""
-    switched = False
-    if choice != NPZ_CHOICE_AUTO:
-        if choice in present:
-            name = choice
-            reason = f"面板选了 {choice}"
-        else:
-            name = ""
-            reason = f"面板选的 {choice} 不在 take 目录里 → 退回自动"
-    else:
-        name = ""
-    if not name:
-        # AUTO：先看三份带 foot_contacts 的是否一致
-        if consistency["equal"] is False and OFFICIAL_STEP5_NPZ in with_contacts:
-            name = OFFICIAL_STEP5_NPZ
-            switched = True
-            reason = reason or "三份接触分数不一致 → 用官方第 5 步语义输入"
-        else:
-            for candidate in (DEFAULT_BODY_NPZ, *BODY_NPZ_NAMES):
-                if candidate in with_contacts:
-                    name = candidate
-                    break
-            if not name:
-                for candidate in BODY_NPZ_NAMES:
-                    if candidate in present:
-                        name = candidate
-                        break
-            reason = reason or "自动（final → body_postprocess → body_origin）"
-    path = present.get(name, "")
-    frames = npz_frame_count(path) if path else 0
-    return {
-        "name": name,
-        "path": path,
-        "frames": frames,
-        "reason": reason,
-        "consistency": consistency,
-        "switched": switched,
-    }
-
-
-def find_contacts(
-    take_dir: str,
-    *,
-    explicit: str = "",
-    choice: str = NPZ_CHOICE_AUTO,
-) -> dict[str, Any]:
-    """接触分数按 1/2/3 顺序解析，返回来源与**面板原样显示**的状态文字。
-
-    返回 ``{"source", "path", "frames", "status", "note"}``；``source`` 取
-    ``CONTACT_TAKE`` / ``CONTACT_GEOMETRY``。
-    第 1 档会把「三份 npz 的 foot_contacts 是否一致」写进 ``status``（运行时校验）。
-
-    旧的「同 take 临时官方 npz」（``F:\flowhmr_official_out``）分支已删除：它按 take
-    token 做**前缀**匹配，``t1`` 会命中 ``t1499_OFFICIAL_nopost.npz`` 这种无关文件，
-    等于把别的动作的接触数据静默套到当前 take 上。
+    ``frame_start`` 是 npz 第 0 行对应的源帧号，调用方据此换算 Blender 帧偏移。
     """
 
     if explicit:
-        if os.path.isfile(explicit):
-            if npz_has_foot_contacts(explicit):
-                return {
-                    "source": CONTACT_TAKE,
-                    "path": explicit,
-                    "frames": npz_frame_count(explicit),
-                    "status": f"接触分数：手动指定（{explicit}）",
-                    "note": "手动指定",
-                }
+        if os.path.isfile(explicit) and npz_has_foot_contacts(explicit):
             return {
-                "source": CONTACT_GEOMETRY,
-                "path": "",
-                "frames": 0,
-                "status": f"接触分数：手动指定的 npz 没有 foot_contacts（{explicit}）→ "
-                          "无接触分数，planted 由几何推断",
-                "note": "manual without foot_contacts",
+                "source": "MANUAL",
+                "path": explicit,
+                "frame_start": 0,
+                "status": f"接触分数：手动指定（{os.path.basename(explicit)}）",
             }
         return {
-            "source": CONTACT_GEOMETRY,
+            "source": "NONE",
             "path": "",
-            "frames": 0,
-            "status": f"接触分数：手动指定的文件不存在（{explicit}）→ "
-                      "无接触分数，planted 由几何推断",
-            "note": "manual missing",
+            "frame_start": 0,
+            "status": "接触分数：手动指定的文件没有 foot_contacts → 由几何推断",
         }
-
-    # 1) take 目录里有带 foot_contacts 的 npz（正规 take：final / body_postprocess / body_origin）
-    if take_dir and os.path.isdir(take_dir):
-        resolved = resolve_body_npz(take_dir, choice)
-        consistency = resolved["consistency"]
-        if consistency["with_contacts"]:
-            name = resolved["name"]
-            frames = resolved["frames"]
-            status = f"接触分数：take 目录内 {name}（{frames} 帧，带 foot_contacts）"
-            if consistency["status"]:
-                status += f"；{consistency['status']}"
-            elif len(consistency["with_contacts"]) == 1:
-                status += "；目录里只有这一份带 foot_contacts"
-            if resolved["switched"]:
-                status += f"；已自动切到 {name}"
-            elif resolved["reason"]:
-                status += f"；{resolved['reason']}"
-            return {
-                "source": CONTACT_TAKE,
-                "path": resolved["path"],
-                "frames": frames,
-                "status": status,
-                "note": f"take dir:{name}",
-                "npz_name": name,
-                "npz_choice": choice,
-                "consistency": consistency,
-            }
-
-    # 2) 几何回退：npz 里没有 foot_contacts（新格式就是这样）
+    body = pick_npz(take_dir) if take_dir else ""
+    if body and npz_has_foot_contacts(body):
+        return {
+            "source": CONTACT_NPZ,
+            "path": body,
+            "frame_start": 0,
+            "status": f"接触分数：主 npz（{os.path.basename(body)}）",
+        }
+    sidecar = pick_contacts_npz(take_dir) if take_dir else {}
+    if sidecar:
+        return {
+            "source": CONTACT_SIDECAR,
+            "path": sidecar["path"],
+            "frame_start": int(sidecar.get("frame_start", 0)),
+            "fps": float(sidecar.get("fps", 0.0)),
+            "channels": list(sidecar.get("channels") or ()),
+            "status": f"接触分数：{os.path.basename(sidecar['path'])}",
+        }
     return {
-        "source": CONTACT_GEOMETRY,
+        "source": "NONE",
         "path": "",
-        "frames": 0,
-        "status": "接触分数：npz 无 foot_contacts，planted 由骨架几何推断",
-        "note": "geometry fallback",
+        "frame_start": 0,
+        "status": "接触分数：无接触分数，planted 由几何推断",
     }
 
 
-def scan_take_dir(
-    path: str,
-    *,
-    contacts_explicit: str = "",
-    npz_choice: str = NPZ_CHOICE_AUTO,
-) -> dict[str, Any]:
-    """一键扫描：take 目录 → fbx / npz / 视频 / 接触分数 + 面板状态文字。
-
-    ``npz_choice`` = ``AUTO`` 或三份标准 body npz 的文件名（面板选择器）；
-    选中的那份写进 ``info["npz"]``/``npz_frames``，三份 foot_contacts 的一致性
-    （``info["contacts_consistency"]``）写进状态行。
-    """
+def scan_take_dir(path: str, *, contacts_explicit: str = "") -> dict[str, Any]:
+    """一键扫描：take 目录 → fbx / npz / 视频 / 接触分数 + 面板状态文字。"""
 
     take_dir = resolve_take_dir(path)
     info: dict[str, Any] = {
@@ -471,25 +338,18 @@ def scan_take_dir(
         "npz_name": "",
         "npz_frames": 0,
         "npz_keys": [],
-        "npz_candidates": {},
-        "npz_choice": npz_choice,
-        "contacts_consistency": {},
         "video": "",
         "video_note": "",
         "contacts": {},
     }
     if not info["exists"]:
         info["status"] = f"找不到 take 目录：{take_dir or '(空)'}　例：{TAKE_DIR_HINT}"
-        info["contacts"] = find_contacts("", explicit=contacts_explicit,
-                                         choice=npz_choice)
+        info["contacts"] = find_contacts("", explicit=contacts_explicit)
         return info
 
     info["fbx"] = pick_fbx(take_dir)
-    info["npz_candidates"] = take_body_npz(take_dir)
-    resolved = resolve_body_npz(take_dir, npz_choice)
-    info["npz"] = resolved["path"] or pick_npz(take_dir)
+    info["npz"] = pick_npz(take_dir)
     info["npz_name"] = os.path.basename(info["npz"]) if info["npz"] else ""
-    info["contacts_consistency"] = resolved["consistency"]
     if info["npz"]:
         try:
             info["npz_frames"] = npz_frame_count(info["npz"])
@@ -498,22 +358,19 @@ def scan_take_dir(
             info["video_note"] = f"npz 读取失败：{exc}"
     video, video_note = find_video(take_dir)
     info["video"] = video
-    info["video_note"] = video_note
-    info["contacts"] = find_contacts(take_dir, explicit=contacts_explicit,
-                                     choice=npz_choice)
+    if video_note:
+        info["video_note"] = video_note
+    info["contacts"] = find_contacts(take_dir, explicit=contacts_explicit)
 
     take_label = os.path.basename(take_dir.rstrip("\\/")) or take_dir
     parts = [f"take={take_label}"]
-    parts.append("动作文件=" + (os.path.basename(info['fbx']) if info['fbx'] else '缺'))
+    parts.append("动作文件=" + (os.path.basename(info["fbx"]) if info["fbx"] else "缺"))
     parts.append(
-        f"npz={os.path.basename(info['npz'])}"
-        f"（{info['npz_frames']} 帧）" if info["npz"] else "npz=缺"
+        f"npz={os.path.basename(info['npz'])}（{info['npz_frames']} 帧）"
+        if info["npz"] else "npz=缺"
     )
-    if len(info["npz_candidates"]) > 1:
-        parts.append(f"另可选={'/'.join(n for n in info['npz_candidates'] if n != info['npz_name'])}")
-    parts.append(
-        f"视频={os.path.basename(video)}" if video else "视频=缺"
-    )
+    parts.append(f"视频={os.path.basename(video)}" if video else "视频=缺")
+    parts.append(str((info.get("contacts") or {}).get("status") or "接触分数：无"))
     info["status"] = "官方产物：" + " · ".join(parts)
     return info
 

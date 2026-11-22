@@ -589,6 +589,45 @@ class MD_PG_ProjectSettings(PropertyGroup):
         description="Blender 帧 = npz 第 i 帧 + 这个偏移（30fps，帧 f 对应视频帧 f−1）",
     )
     # 预留步骤（index 1）：两脚张开程度补偿，写 foot_ik（IK），不写 FK。
+    foot_lock_strength: FloatProperty(
+        default=1.0, min=0.0, max=1.0, precision=2,
+        name="水平锁定强度",
+        description="支撑段内把脚的水平位置锁到锚点的比例。1.0 = 全锁定（默认，闭环残差 0.1 mm 级）；"
+                    "参考实现的自动档是 0.35、手动档 0.95，调低会更自然但会留下滑步",
+    )
+    foot_lock_max_correction: FloatProperty(
+        default=0.0, min=0.0, max=0.5, precision=3,
+        name="单帧修正上限（米）",
+        description="单帧水平修正量的封顶，0 = 不封顶。参考实现用约 0.07 m；"
+                    "调小可防止大偏差把脚猛拽过去",
+    )
+    foot_contact_threshold: FloatProperty(
+        default=0.75, min=0.05, max=1.0, precision=2,
+        name="触地分数阈值",
+        description="foot_contacts 分数达到这个值才算触地（参考实现 0.75）",
+    )
+    foot_contact_min_frames: IntProperty(
+        default=3, min=1, max=120,
+        name="最短触地帧数",
+        description="短于这个帧数的触地段直接丢掉（参考实现 3 帧）",
+    )
+    foot_contact_bridge_gap: IntProperty(
+        default=6, min=0, max=120,
+        name="触地桥接帧数",
+        description="两段触地之间不超过这么多帧的空洞并入同一段（参考实现 6 帧）",
+    )
+    foot_level_strength: FloatProperty(
+        default=0.0, min=0.0, max=1.0, precision=2,
+        name="脚掌压平强度",
+        description="按实测 heel/toe 高差把脚掌摆平的比例；0 = 关闭。"
+                    "实测这段素材鞋底高差只有约 5 mm（≈2°），开启没有收益还会明显变慢，"
+                    "默认关闭，换到真的有斜脚掌的素材再调",
+    )
+    foot_level_max_deg: FloatProperty(
+        default=12.0, min=0.0, max=45.0, precision=1,
+        name="脚掌压平上限（度）",
+        description="单帧脚掌微调的最大角度，避免把脚尖动作压没",
+    )
     foot_spacing_clearance_ratio: FloatProperty(
         default=0.55, min=0.0, max=1.5, precision=3,
         name="贴紧间距比",
@@ -636,27 +675,6 @@ class MD_PG_ProjectSettings(PropertyGroup):
         name="body npz",
         description="实际选中的那份 body npz（帧数、接触分数解析都用它）；"
                     "由下面的选择器/自动规则决定，也可直接手填别的路径",
-    )
-    official_npz_choice: EnumProperty(
-        items=(
-            ("AUTO", "自动（final → body_postprocess → body_origin）",
-             "三份 foot_contacts 一致（实测一致）→ 默认 final.npz（FBX 对应的最终动作）；"
-             "若哪天不一致则改用 body_postprocess.npz（官方第 5 步语义输入）"),
-            ("final.npz", "final.npz（最终：后处理 + HaMeR 手）",
-             "该 take 的最终动作，也是 final.fbx 对应的那一份（默认）"),
-            ("body_postprocess.npz", "body_postprocess.npz（官方后处理，未并手）",
-             "做完脚接触/IK 等后处理，手指仍是 FlowHMR 的；官方第 5 步的语义输入"),
-            ("body_origin.npz", "body_origin.npz（FlowHMR 原始输出）",
-             "未后处理的原始 body 结果"),
-        ),
-        default="AUTO",
-        name="用哪份 body npz（内部）",
-        description="内部自动决定；界面上不出现",
-    )
-    official_video: StringProperty(
-        subtype="FILE_PATH",
-        name="参考视频",
-        description="默认 take 目录里的 working_30fps.mp4",
     )
     official_contacts_npz: StringProperty(
         subtype="FILE_PATH",

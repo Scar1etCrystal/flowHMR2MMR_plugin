@@ -19,6 +19,7 @@ from .core import animation as core_animation
 from .core import contacts as core_contacts
 from .core import export as core_export
 from .core import foot_contacts as core_foot_contacts
+from .core import foot_plant as core_foot_plant
 from .core import foot_spacing as core_foot_spacing
 from .core import official_import as core_official_import
 from .core import pkl_hand as core_pkl_hand
@@ -446,6 +447,51 @@ def _record_report(scene, step_id, report, status, message, params=None):
         parameter_hash=project.parameter_hash(params or report.get("params", {})),
     )
     return path
+
+
+def _foot_ranges_edited(scene):
+    """用户是否手改过脚部区间（生效区间与自动区间不一致）。"""
+
+    for auto, effective in (
+        (annotation.CHANNEL_FOOT_L_AUTO, annotation.CHANNEL_FOOT_L_EFFECTIVE),
+        (annotation.CHANNEL_FOOT_R_AUTO, annotation.CHANNEL_FOOT_R_EFFECTIVE),
+    ):
+        left = annotation.get_channel_ranges(scene, auto)
+        right = annotation.get_channel_ranges(scene, effective)
+        if len(left) != len(right):
+            return True
+        for one, two in zip(left, right):
+            if int(one[0]) != int(two[0]) or int(one[1]) != int(two[1]):
+                return True
+    return False
+
+
+def _contact_driven_planted(scene, settings):
+    """支撑段：手改过的区间 > npz 接触分数 > 自动区间。
+
+    分数是 0–1 的软权重，按「≥阈值且连续 ≥N 帧、桥接 ≤M 帧」切成段，
+    与参考实现一致；没有分数或用户已经手调过区间时，直接用生效区间，
+    不覆盖人工修改。
+    """
+
+    ranges = _planted_ranges(scene)
+    npz_path = str(getattr(settings, "foot_contacts_npz", "") or "")
+    if not npz_path or _foot_ranges_edited(scene):
+        return ranges, ("manual_ranges" if npz_path else "ranges")
+    weights = core_foot_plant.contact_weights(npz_path, 0)
+    if not weights:
+        return ranges, "ranges"
+    segments = core_foot_plant.stance_segments(
+        weights,
+        settings.mocap_frame_start,
+        threshold=settings.foot_contact_threshold,
+        min_frames=settings.foot_contact_min_frames,
+        bridge_gap=settings.foot_contact_bridge_gap,
+        trim=settings.lock_trim,
+    )
+    if not any(segments.values()):
+        return ranges, "ranges"
+    return segments, "contacts"
 
 
 def _planted_ranges(scene):
@@ -1526,39 +1572,45 @@ def _run_target_floor(context, settings):
     )
     _validate_correction_transform(correction)
     action = project.begin_action_preview(scene, correction, "target_floor")
+    contact_planted, segment_source = _contact_driven_planted(scene, settings)
     params = {
         "floor_z": settings.target_floor_z,
-        "target_clearance": settings.target_clearance,
-        "tolerance": settings.target_floor_tolerance,
-        "max_lift_per_frame": settings.target_floor_max_lift,
-        "strength": settings.target_floor_strength,
-        "smooth_radius": settings.target_floor_smooth_radius,
-        "max_delta_per_frame": settings.target_floor_max_delta,
-        "visible_only": settings.target_visible_only,
-        "vertex_sample_step": settings.target_vertex_sample_step,
-        "reset_existing_z_curve": settings.target_reset_existing_z,
+        "clearance": settings.target_clearance,
+        "max_step": settings.ground_max_delta,
+        "smooth_radius": settings.ground_smooth_radius,
     }
-    result = core_target.repair_mesh_floor_lift_v3_safe(
+    result = core_foot_plant.ground_root(
         scene,
-        model_root,
-        correction,
-        action=action,
+        rig,
+        settings.target_mesh,
+        action,
+        contact_planted,
         frame_start=settings.mocap_frame_start,
         frame_end=settings.mocap_frame_end,
         **params,
     )
-    result["created_correction_empty"] = created_correction
-    _record_report(scene, "target_floor", result, "PREVIEW", "模型 Mesh 穿地修复等待检查", params)
-    message = f"Mesh 地面修复影响 {result.get('changed_frames', 0)} 帧"
-    if created_correction:
-        message += "；已补建全局校正 Empty（未扶正）"
+    result["planted_source"] = segment_source
+    if not isinstance(result.get("params"), dict):
+        result["params"] = dict(params)
+    result["params"]["grounding"] = "sole_min_root_fill"
+    result["params"]["ballistic"] = False
+    _record_report(scene, "ground_feet", result, "PREVIEW", "贴地预览等待检查", params)
+    before = result.get("sole_before") or {}
+    after = result.get("sole_after") or {}
+    message = (
+        f"按鞋底回填 {result.get('applied', 0)} 帧"
+        f"（触地 {result.get('grounded_frames', 0)} 帧）"
+        f"；鞋底离地 {before.get('mean_abs_mm', 0.0):.1f} → {after.get('mean_abs_mm', 0.0):.1f} mm"
+    )
+    if result.get("skipped"):
+        message = f"贴地跳过：{result['skipped']}"
     return message
 
 
 def _run_foot_lock(context, settings):
     scene = context.scene
     _require_restore_before_rerun(scene, "foot_lock")
-    planted = _planted_ranges(scene)
+    planted, segment_source = _contact_driven_planted(scene, settings)
     if not any(planted.values()):
         raise RuntimeError("最终 planted 区间为空，请先完成接触区间修订")
     rig = _require_object(settings, "mmr_rig", "ARMATURE")
@@ -1641,9 +1693,24 @@ def _run_foot_lock(context, settings):
         trim_segment_ends=settings.lock_trim,
         min_segment_len=settings.lock_min_segment_len,
         blend_frames=settings.lock_blend_frames,
+        lock_strength=settings.foot_lock_strength,
+        lock_max_correction=settings.foot_lock_max_correction,
+    )
+    leveled = core_foot_plant.level_feet(
+        scene,
+        armature,
+        rig,
+        settings.target_mesh,
+        action,
+        planted,
+        strength=settings.foot_level_strength,
+        max_deg=settings.foot_level_max_deg,
+        floor_z=settings.target_floor_z,
     )
     report = {
         "operation": "analyze_and_lock_mmd_foot_ik",
+        "planted_source": segment_source,
+        "level_feet": leveled,
         "drift_before": drift,
         "repair": repair,
         "stabilize": stabilized,
@@ -1667,22 +1734,6 @@ def _run_foot_lock(context, settings):
     if stabilized.get("verification") == "unconverged":
         message += "；个别段首帧残余未收敛（落地帧腿够程上限），见报告"
     return message
-
-
-def _air_source_labels(scene):
-    """Map each airborne radio to its annotation provenance, for the report."""
-
-    labels = []
-    for record in getattr(scene, "mcd_annotation_ranges", ()):
-        if record.channel != annotation.CHANNEL_AIR:
-            continue
-        labels.append(
-            {
-                "frames": [int(record.frame_start), int(record.frame_end)],
-                "source": str(record.source or ""),
-            }
-        )
-    return labels
 
 
 def _run_ground_feet(context, settings):
@@ -1726,47 +1777,38 @@ def _run_ground_feet(context, settings):
     # model's own bind-pose drop (~5.6 cm on 模型).  Read it off the model
     # instead of carrying a hand tuned default.
     sole_offset = core_target.model_sole_offset(armature, settings.target_mesh)
+    contact_planted, segment_source = _contact_driven_planted(scene, settings)
     params = {
         "floor_z": settings.target_floor_z,
         "clearance": settings.target_clearance,
-        "sole_offset": sole_offset,
+        "max_step": settings.ground_max_delta,
         "smooth_radius": settings.ground_smooth_radius,
-        "max_delta": settings.ground_max_delta,
     }
-    result = core_target.ground_feet_outside_airborne(
+    result = core_foot_plant.ground_root(
         scene,
-        armature,
         rig,
+        settings.target_mesh,
         action,
-        airborne,
-        planted_ranges=planted_spans,
+        contact_planted,
         frame_start=settings.mocap_frame_start,
         frame_end=settings.mocap_frame_end,
         **params,
     )
-    result["airborne_sources"] = _air_source_labels(scene)
-    result["params"]["pin_mode"] = "planted"
-    result["params"]["planted_spans"] = len(planted_spans)
-    _record_report(scene, "ground_feet", result, "PREVIEW", "贴地锁定等待检查", params)
-    message = (
-        f"贴地锁定 {result.get('changed_frames', 0)} 帧"
-        f"（仅贴地区间 {result.get('planted_frames', 0)} 帧）"
-        f"，最大修正 {result.get('max_applied_correction', 0.0) * 1000:.0f} mm"
+    result["planted_source"] = segment_source
+    if not isinstance(result.get("params"), dict):
+        result["params"] = dict(params)
+    result["params"]["grounding"] = "sole_min_root_fill"
+    result["params"]["ballistic"] = False
+    _record_report(scene, "ground_feet", result, "PREVIEW", "贴地预览等待检查", params)
+    before = result.get("sole_before") or {}
+    after = result.get("sole_after") or {}
+    if result.get("skipped"):
+        return f"贴地跳过：{result['skipped']}"
+    return (
+        f"按鞋底回填 {result.get('applied', 0)} 帧"
+        f"（触地 {result.get('grounded_frames', 0)} 帧）"
+        f"；鞋底离地 {before.get('mean_abs_mm', 0.0):.1f} → {after.get('mean_abs_mm', 0.0):.1f} mm"
     )
-    spans = result.get("airborne_segments", ())
-    if spans:
-        ballistic = sum(1 for item in spans if item.get("mode") == "ballistic")
-        message += f"；腾空段 {len(spans)} 个（弹道重建 {ballistic}）"
-    else:
-        message += "；没有腾空区间——若这段舞有跳跃，请先标注再重跑，否则跳跃会被压平"
-    suspects = result.get("unmarked_airborne_suspects", ())
-    if suspects:
-        worst = suspects[0]
-        message += (
-            f"；另有 {len(suspects)} 段没标腾空但脚离地很高"
-            f"（最高 {worst['max_height'] * 100:.0f} cm，见报告）"
-        )
-    return message
 
 
 def _run_export_prep(context, settings):
@@ -4215,22 +4257,16 @@ def _official_source_path(settings) -> str:
 
 
 def _official_scan(settings) -> dict:
-    """跑一次 scan_take_dir：带上面板选择器，并尊重手填的非标准 npz 路径。"""
+    """跑一次 scan_take_dir：带上面板手填的接触文件，并尊重手填的 npz 路径。"""
 
     source = _official_source_path(settings)
-    choice = str(getattr(settings, "official_npz_choice", "") or "AUTO")
     info = core_official_import.scan_take_dir(
         source,
         contacts_explicit=str(settings.official_contacts_npz or "").strip(),
-        npz_choice=choice,
     )
     manual = str(settings.official_npz or "").strip()
-    if (
-        manual
-        and os.path.isfile(manual)
-        and os.path.basename(manual) not in core_official_import.BODY_NPZ_NAMES
-    ):
-        # 用户手填了别的 npz：不要被自动解析覆盖（接触分数仍按三档规则走）
+    if manual and os.path.isfile(manual) and core_official_import.is_body_npz(manual):
+        # 用户手填了别的 body npz：不要被自动解析覆盖
         info["npz"] = manual
         info["npz_name"] = os.path.basename(manual)
         info["npz_frames"] = core_official_import.npz_frame_count(manual)
@@ -4253,6 +4289,11 @@ def _official_apply_scan(settings, info: dict) -> None:
     explicit = str(settings.official_contacts_npz or "").strip()
     resolved = str(contacts.get("path") or "")
     settings.official_contacts_resolved = resolved if not explicit else ""
+    # 旁路接触文件会把「第 0 行对应哪个源帧」写在 frame_start 里；我们的约定是
+    # blender_frame = npz_index + npz_frame_offset，第 0 行对应 Blender 第 1 帧。
+    if resolved and not explicit:
+        started = int(contacts.get("frame_start", 0) or 0)
+        settings.npz_frame_offset = 1 + started
 
 
 def _official_resolved_contacts(settings) -> tuple[str, str]:
@@ -4271,7 +4312,6 @@ def _official_resolved_contacts(settings) -> tuple[str, str]:
     if resolved and os.path.isfile(resolved):
         source = (core_official_import.find_contacts(
             core_official_import.resolve_take_dir(_official_source_path(settings)),
-            choice=str(getattr(settings, "official_npz_choice", "") or "AUTO"),
         ) or {})
         what = source.get("status") or f"接触分数：{resolved}"
         return resolved, what

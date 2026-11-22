@@ -59,9 +59,6 @@ DEFAULT_GROUND_POINTS = {
     "L": (("足首.L", "head"), ("足首.L", "tail")),
     "R": (("足首.R", "head"), ("足首.R", "tail")),
 }
-# Airborne spans are rebuilt ballistically; gravity is what turns the marked
-# flight time into a jump height, so it is a physical constant, not a taste knob.
-GRAVITY = 9.81
 # 0.8 s of flight is already a 78 cm jump (g*T^2/8); anything longer is not a
 # jump, so it falls back to interpolating the neighbouring pins.
 BALLISTIC_MAX_FRAMES = 24
@@ -2110,6 +2107,8 @@ def stabilize_planted_feet(
     trim_segment_ends: int = 2,
     min_segment_len: int = 5,
     blend_frames: int = 2,
+    lock_strength: float = 1.0,
+    lock_max_correction: float = 0.0,
     pos_tolerance: float = STABILIZE_POS_TOLERANCE,
     rot_tolerance_deg: float = STABILIZE_ROT_TOLERANCE_DEG,
     worst_sample_limit: int = 100,
@@ -2653,7 +2652,15 @@ def stabilize_planted_feet(
             # old as_pointer() diff rewrote the curve's FIRST keys instead)
             add_missing_keys(curve, frames_needed, cache)
 
-    def _write(corrections, measured):
+    def _write(corrections, measured, *, strength=1.0, max_correction=0.0):
+        """把修正写进 foot_ik。
+
+        ``strength`` 缩放「相对未修正姿势」的修正量（1.0 = 全锁定），
+        ``max_correction`` 对水平（X/Y）单帧修正量做封顶（米，0 = 不封顶）。
+        参考实现用 0.35（自动）/ 0.95（手动）+ 约 7 cm 上限；我们默认全强度，
+        因为闭环残差本来就只有 0.1 mm 级。
+        """
+
         written = 0
         touched: set[Any] = set()
         for side in ("L", "R"):
@@ -2674,6 +2681,27 @@ def stabilize_planted_feet(
                 )
                 basis = multiplier @ m_target
                 loc = basis.to_translation()
+                if float(strength) < 1.0 or float(max_correction) > 0.0:
+                    original = [
+                        (float(setup["loc_cache"][axis][frame].co.y)
+                         if frame in setup["loc_cache"][axis] else None)
+                        for axis in range(3)
+                    ]
+                    limited = list(loc)
+                    for axis in range(3):
+                        base = original[axis] if original[axis] is not None else 0.0
+                        limited[axis] = base + (float(loc[axis]) - base) * float(strength)
+                    if float(max_correction) > 0.0:
+                        dx = limited[0] - (original[0] if original[0] is not None else 0.0)
+                        dy = limited[1] - (original[1] if original[1] is not None else 0.0)
+                        magnitude = math.hypot(dx, dy)
+                        if magnitude > float(max_correction):
+                            scale = float(max_correction) / magnitude
+                            base_x = original[0] if original[0] is not None else 0.0
+                            base_y = original[1] if original[1] is not None else 0.0
+                            limited[0] = base_x + dx * scale
+                            limited[1] = base_y + dy * scale
+                    loc = Vector(limited)
                 for axis in range(3):
                     key = setup["loc_cache"][axis].get(frame)
                     if key is None:
@@ -2754,7 +2782,9 @@ def stabilize_planted_feet(
         verification = "already_still"
         after_rows = before_rows
     else:
-        frames_written = _write(_corrections(measured), measured)
+        frames_written = _write(_corrections(measured), measured,
+                                strength=lock_strength,
+                                max_correction=lock_max_correction)
         print(f"[STAB] wrote corrections: {frames_written} frames", flush=True)
 
         # P3: _interior_residuals reads only the weight-1 interiors (anchors sit
@@ -2829,80 +2859,10 @@ def stabilize_planted_feet(
     return report
 
 
-def _pin_corrections(lowest_by_frame, frame_start, frame_end, target_z):
-    """Signed whole-body shifts that put the lowest foot on the floor.
-
-    Unconditional by design: the annotation only marks where the person is
-    AIRBORNE, so every other frame counts as a contact and gets pinned.  A
-    frame with no usable sample holds the previous value - a missing sample is
-    a data gap, not a reason to move the body.
-    """
-
-    corrections: dict[int, float] = {}
-    missing: list[int] = []
-    previous = 0.0
-    for frame in range(int(frame_start), int(frame_end) + 1):
-        lowest = lowest_by_frame.get(frame)
-        if lowest is None:
-            missing.append(frame)
-            corrections[frame] = previous
-            continue
-        previous = float(target_z) - float(lowest)
-        corrections[frame] = previous
-    return corrections, missing
 
 
-def _smooth_limit_grounded(
-    corrections, airborne_frames, frame_start, frame_end, radius, max_delta
-):
-    """Smooth and rate-limit inside each grounded stretch, never across a flight.
-
-    The rate limit is what keeps the body from hopping at stretch edges, but a
-    real takeoff moves several cm per frame; letting the smoothing or the limit
-    see across an airborne span would flatten the jump, so both utilities run
-    per stretch instead.
-    """
-
-    out = dict(corrections)
-    start, end = int(frame_start), int(frame_end)
-    frame = start
-    while frame <= end:
-        if frame in airborne_frames:
-            frame += 1
-            continue
-        run_start = frame
-        while frame + 1 <= end and (frame + 1) not in airborne_frames:
-            frame += 1
-        run_end = frame
-        values = {f: float(out.get(f, 0.0)) for f in range(run_start, run_end + 1)}
-        if int(radius) > 0:
-            values = smooth_frame_values(values, run_start, run_end, int(radius))
-        if float(max_delta) > 0.0:
-            values = limit_frame_delta(values, run_start, run_end, float(max_delta))
-        out.update(values)
-        frame += 1
-    return out
 
 
-def _ballistic_z(z0, z1, t0, t1, frames, fps, gravity):
-    """Vertical positions of a true ballistic arc through both anchors.
-
-    ``z0``/``z1`` are the body heights at the takeoff and landing anchors and
-    ``t1 - t0`` is the flight time.  Gravity plus the flight time decide the
-    apex (equal anchors: g*T^2/8) - that is the point of rebuilding instead of
-    interpolating: a jump flies at the height its duration implies, so GVHMR's
-    crushed arcs are restored and the drift correction rides along for free.
-    """
-
-    duration = (int(t1) - int(t0)) / float(fps)
-    initial = (float(z1) - float(z0)) / duration + 0.5 * float(gravity) * duration
-    arc: dict[int, float] = {}
-    for frame in frames:
-        t = (int(frame) - int(t0)) / float(fps)
-        arc[int(frame)] = (
-            float(z0) + initial * t - 0.5 * float(gravity) * t * t
-        )
-    return arc
 
 
 def _world_z_shift_in_object_space(obj, delta):
@@ -2917,13 +2877,6 @@ def _world_z_shift_in_object_space(obj, delta):
     return (float(local.x), float(local.y), float(local.z))
 
 
-def _world_z_shift_from_parent_rot(parent_rot_inv, delta):
-    """_world_z_shift_in_object_space with the parent's inverted world rotation
-    recorded beforehand (None = no parent)."""
-    if parent_rot_inv is None:
-        return (0.0, 0.0, float(delta))
-    local = parent_rot_inv @ Vector((0.0, 0.0, float(delta)))
-    return (float(local.x), float(local.y), float(local.z))
 
 
 def model_sole_offset(
@@ -2966,319 +2919,4 @@ def model_sole_offset(
     return float(min(rest) - sole)
 
 
-def ground_feet_outside_airborne(
-    scene: Any,
-    sample_armature: Any,
-    move_object: Any,
-    action: Any,
-    airborne_ranges: Sequence[Sequence[int]] = (),
-    *,
-    planted_ranges: Sequence[Sequence[int]] | None = None,
-    contact_points: Mapping[str, Sequence[tuple[str, str]]] = DEFAULT_GROUND_POINTS,
-    frame_start: int | None = None,
-    frame_end: int | None = None,
-    floor_z: float = 0.0,
-    clearance: float = 0.0015,
-    sole_offset: float = 0.0,
-    smooth_radius: int = 2,
-    max_delta: float = 0.01,
-    worst_sample_limit: int = 100,
-) -> dict[str, Any]:
-    """Pin the lowest foot to the floor everywhere except marked airborne spans.
-
-    The old design pinned the frames a *planted* detection called contacts, and
-    it could not be made to work: GVHMR's data does not let anyone tell a float
-    from a jump, so a detection band either missed floats entirely (0001-1499
-    stopped detecting at frame 566 of 1499) or admitted 16 cm of air as a
-    contact (0001-0999 frames 1-11: pinned 19.3 cm, then yanked back - the
-    "comic hop").  Both failures share one root: the annotation asked a human to
-    mark something invisible in the data.
-
-    This pass inverts it.  A human marks where the person is AIRBORNE - few,
-    obvious, visible in the video - and every other frame counts as a contact
-    and is pinned unconditionally, PoseCapture's way.  Nothing has to infer
-    contact from corrupted data any more.
-
-    Airborne spans are rebuilt as a true ballistic arc anchored at the pinned
-    heights on both sides: the body flies at the height its duration implies
-    (equal anchors: g*T^2/8), which restores GVHMR's crushed jumps, and the
-    drift correction rides through the flight for free - no takeoff boost, no
-    landing settle.  A span longer than ``BALLISTIC_MAX_FRAMES`` (0.8 s, i.e. a
-    78 cm jump) or missing an anchor falls back to a smooth interpolation
-    between the neighbouring pins.
-
-    The rig object moves rather than a bone because a top level object's
-    ``location`` is plain world metres, and because the MMD armature follows the
-    rig through WORLD-space copy constraints; the correction therefore rides
-    into MMD Visual Bake and on into the VMD, and survives a re-bake.
-
-    Sampling reads *sample_armature* (the constrained MMD skeleton, i.e. what
-    will be baked) while *move_object* is the rig that gets the correction.
-    """
-
-    start, end = resolve_frame_range(scene, frame_start, frame_end)
-    if get_action(move_object) is not action:
-        raise RuntimeError("the supplied Action is not active on the MMR rig")
-    if int(smooth_radius) < 0:
-        raise ValueError("smooth_radius must be non-negative")
-    if float(max_delta) < 0.0:
-        raise ValueError("max_delta must be non-negative")
-
-    prepared: dict[str, list[tuple[str, str]]] = {}
-    missing_bones: list[str] = []
-    for side in ("L", "R"):
-        points = [
-            (bone_name, point)
-            for bone_name, point in contact_points[side]
-            if sample_armature.pose.bones.get(bone_name) is not None
-        ]
-        if not points:
-            missing_bones.extend(name for name, _point in contact_points[side])
-        prepared[side] = points
-    if not any(prepared.values()):
-        raise RuntimeError("目标骨架缺少贴地接触骨：" + ", ".join(missing_bones))
-
-    spans = normalize_ranges(airborne_ranges, frame_start=start, frame_end=end)
-    airborne_frames: set[int] = set()
-    for raw_start, raw_end in spans:
-        airborne_frames.update(range(raw_start, raw_end + 1))
-
-    # planted_ranges = pin ONLY inside these spans (user decision 2026-10-17).
-    # Without it the pass keeps its old "pin everything that is not airborne"
-    # behaviour, which also lifted the swing/floating frames.
-    planted_frames: set[int] | None = None
-    pin_frames: set[int] | None = None
-    if planted_ranges is not None:
-        planted_frames = set()
-        for raw_start, raw_end in normalize_ranges(
-            planted_ranges, frame_start=start, frame_end=end
-        ):
-            planted_frames.update(range(raw_start, raw_end + 1))
-        pin_frames = planted_frames | airborne_frames
-
-    lowest_by_frame: dict[int, float | None] = {}
-    original_location: dict[int, tuple[float, float, float]] = {}
-    view_layer = current_view_layer()
-    if bpy is None:
-        raise RuntimeError("foot grounding must run inside Blender")
-    parent_rot_inv: dict[int, Any] = {}     # 写入遍用：父物体世界旋转之逆（逐帧）
-    with preserve_scene_frame(scene, view_layer):
-        for frame in range(start, end + 1):
-            set_scene_frame(scene, frame, view_layer)
-            original_location[frame] = tuple(float(value) for value in move_object.location)
-            if move_object.parent is not None:
-                parent_rot_inv[frame] = \
-                    move_object.parent.matrix_world.inverted_safe().to_3x3()
-            # The MMD skeleton is driven by constraints, so its world pose only
-            # exists on the evaluated copy.  Reading the original object reports
-            # the stale pre-constraint pose, which measured feet up to 5 cm away
-            # from where the viewer actually sees them.
-            evaluated = sample_armature.evaluated_get(
-                bpy.context.evaluated_depsgraph_get()
-            )
-            lowest: float | None = None
-            for points in prepared.values():
-                for bone_name, point in points:
-                    location = pose_bone_point_world(evaluated, bone_name, point)
-                    if location is None:
-                        continue
-                    z = float(location.z)
-                    lowest = z if lowest is None else min(lowest, z)
-            lowest_by_frame[frame] = lowest
-
-    target_z = float(floor_z) + float(clearance) + float(sole_offset)
-    fps_base = float(getattr(scene.render, "fps_base", 1.0)) or 1.0
-    fps = float(scene.render.fps) / fps_base
-
-    corrected, missing_samples = _pin_corrections(
-        lowest_by_frame, start, end, target_z
-    )
-    if pin_frames is not None:
-        # Outside the planted spans the body is moving/swinging: leave it alone.
-        for frame in list(corrected):
-            if frame not in pin_frames:
-                corrected[frame] = 0.0
-    corrected = _smooth_limit_grounded(
-        corrected, airborne_frames, start, end, int(smooth_radius), float(max_delta)
-    )
-    if pin_frames is not None:
-        # Smoothing must not bleed a planted correction into the swing frames.
-        for frame in list(corrected):
-            if frame not in pin_frames:
-                corrected[frame] = 0.0
-
-    airborne_stats: list[dict[str, Any]] = []
-    for raw_start, raw_end in spans:
-        frames = list(range(raw_start, raw_end + 1))
-        takeoff = next(
-            (f for f in range(raw_start - 1, start - 1, -1) if f not in airborne_frames),
-            None,
-        )
-        landing = next(
-            (f for f in range(raw_end + 1, end + 1) if f not in airborne_frames),
-            None,
-        )
-        entry: dict[str, Any] = {
-            "frames": [raw_start, raw_end],
-            "length": len(frames),
-            "takeoff_anchor": takeoff,
-            "landing_anchor": landing,
-        }
-        if (
-            takeoff is not None
-            and landing is not None
-            and (landing - takeoff) <= BALLISTIC_MAX_FRAMES
-        ):
-            z0 = original_location[takeoff][2] + corrected[takeoff]
-            z1 = original_location[landing][2] + corrected[landing]
-            arc = _ballistic_z(z0, z1, takeoff, landing, frames, fps, GRAVITY)
-            for frame in frames:
-                corrected[frame] = arc[frame] - original_location[frame][2]
-            entry.update(
-                {
-                    "mode": "ballistic",
-                    "flight_seconds": round((landing - takeoff) / fps, 4),
-                    "apex_height": round(max(arc.values()) - min(z0, z1), 4),
-                }
-            )
-        else:
-            if takeoff is None and landing is None:
-                start_value = end_value = 0.0
-            elif takeoff is None:
-                start_value = end_value = corrected[landing]
-            elif landing is None:
-                start_value = end_value = corrected[takeoff]
-            else:
-                start_value = corrected[takeoff]
-                end_value = corrected[landing]
-            for offset, frame in enumerate(frames):
-                weight = (offset + 1) / (len(frames) + 1.0)
-                corrected[frame] = start_value + (end_value - start_value) * weight
-            entry["mode"] = (
-                "interpolated" if takeoff is not None and landing is not None else "held"
-            )
-            if entry["mode"] == "interpolated":
-                entry["note"] = (
-                    f"腾空段 {len(frames)} 帧超过弹道重建上限 "
-                    f"{BALLISTIC_MAX_FRAMES} 帧，按两端插值"
-                )
-        airborne_stats.append(entry)
-
-    fuse_clamped = 0
-    for frame in range(start, end + 1):
-        if abs(corrected[frame]) > MAX_CORRECTION:
-            corrected[frame] = math.copysign(MAX_CORRECTION, corrected[frame])
-            fuse_clamped += 1
-
-    curves = [ensure_fcurve(action, "location", axis) for axis in range(3)]
-    caches = [keyframe_map(curve) for curve in curves]
-    changed_frames = 0
-    max_applied = 0.0
-    measured: list[dict[str, Any]] = []
-    with preserve_scene_frame(scene, view_layer):
-        for frame in range(start, end + 1):
-            correction = float(corrected.get(frame, 0.0))
-            # 不再逐帧 frame_set（任务2）：换算只需要父物体的世界矩阵，而父物体
-            # 不受本物体位置 key 的影响——读取遍里已逐帧记下，结果逐位相同。
-            delta = _world_z_shift_from_parent_rot(
-                parent_rot_inv.get(frame), correction)
-            base = original_location[frame]
-            for axis in range(3):
-                set_fcurve_value(
-                    curves[axis],
-                    frame,
-                    base[axis] + delta[axis],
-                    cache=caches[axis],
-                )
-            if abs(correction) > EPSILON:
-                changed_frames += 1
-                max_applied = max(max_applied, abs(correction))
-            lowest = lowest_by_frame.get(frame)
-            if (frame not in airborne_frames
-                    and (pin_frames is None or frame in pin_frames)
-                    and lowest is not None):
-                measured.append(
-                    {
-                        "frame": frame,
-                        "foot_z_before": round(lowest, 6),
-                        "correction": round(correction, 6),
-                        "foot_z_after": round(lowest + correction, 6),
-                    }
-                )
-    for curve in curves:
-        curve.update()
-    update_action(action)
-
-    measured.sort(key=lambda item: abs(item["correction"]), reverse=True)
-    applied = [item["correction"] for item in measured]
-
-    suspects: list[dict[str, Any]] = []
-    current_suspect: dict[str, Any] | None = None
-    for frame in range(start, end + 1):
-        lowest = lowest_by_frame.get(frame)
-        height = None
-        if (frame not in airborne_frames
-                and (pin_frames is None or frame in pin_frames)
-                and lowest is not None):
-            height = lowest - target_z
-        if height is not None and height > SUSPECT_AIRBORNE_HEIGHT:
-            if current_suspect is None:
-                current_suspect = {"frames": [frame, frame], "max_height": height}
-            else:
-                current_suspect["frames"][1] = frame
-                current_suspect["max_height"] = max(
-                    current_suspect["max_height"], height
-                )
-        elif current_suspect is not None:
-            suspects.append(current_suspect)
-            current_suspect = None
-    if current_suspect is not None:
-        suspects.append(current_suspect)
-    suspects.sort(key=lambda item: item["max_height"], reverse=True)
-    suspect_report = [
-        {
-            "frames": item["frames"],
-            "length": item["frames"][1] - item["frames"][0] + 1,
-            "max_height": round(item["max_height"], 4),
-        }
-        for item in suspects[: int(worst_sample_limit)]
-    ]
-
-    return {
-        "operation": "ground_model_feet_outside_airborne",
-        "frame_range": [start, end],
-        "sample_armature": sample_armature.name,
-        "move_object": move_object.name,
-        "params": {
-            "floor_z": float(floor_z),
-            "clearance": float(clearance),
-            "sole_offset": float(sole_offset),
-            "smooth_radius": int(smooth_radius),
-            "max_delta": float(max_delta),
-            "gravity": float(GRAVITY),
-            "ballistic_max_frames": int(BALLISTIC_MAX_FRAMES),
-        },
-        "contact_points": {
-            side: [f"{bone_name}:{point}" for bone_name, point in points]
-            for side, points in prepared.items()
-        },
-        "airborne_segments": airborne_stats,
-        "pin_mode": "planted" if planted_frames is not None else "non_airborne",
-        "planted_frames": (
-            len(planted_frames) if planted_frames is not None else None
-        ),
-        "pinned_frames": (
-            len(planted_frames) if planted_frames is not None
-            else (end - start + 1) - len(airborne_frames)
-        ),
-        "changed_frames": changed_frames,
-        "max_applied_correction": round(max_applied, 6),
-        "correction_range": (
-            [round(min(applied), 6), round(max(applied), 6)] if applied else None
-        ),
-        "fuse_clamped_frames": fuse_clamped,
-        "missing_sample_frames": len(missing_samples),
-        "unmarked_airborne_suspects": suspect_report,
-        "worst_samples": measured[: int(worst_sample_limit)],
-    }
 
