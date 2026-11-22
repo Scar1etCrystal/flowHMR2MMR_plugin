@@ -569,6 +569,43 @@ def _action_bone_names(action, armature):
     }
 
 
+@contextmanager
+def _active_armature(context, armature, pose=False):
+    """Temporarily make ``armature`` the only selected + active object."""
+
+    view_layer = context.view_layer
+    selected = [obj for obj in view_layer.objects if obj.select_get()]
+    active = view_layer.objects.active
+    old_mode = active.mode if active else "OBJECT"
+    try:
+        if active and active.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.select_all(action="DESELECT")
+        armature.hide_set(False)
+        armature.select_set(True)
+        view_layer.objects.active = armature
+        if pose:
+            bpy.ops.object.mode_set(mode="POSE")
+        yield
+    finally:
+        try:
+            if view_layer.objects.active and view_layer.objects.active.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
+        bpy.ops.object.select_all(action="DESELECT")
+        for obj in selected:
+            if obj.name in view_layer.objects:
+                obj.select_set(True)
+        if active and active.name in view_layer.objects:
+            view_layer.objects.active = active
+            if old_mode != "OBJECT":
+                try:
+                    bpy.ops.object.mode_set(mode=old_mode)
+                except RuntimeError:
+                    pass
+
+
 def _validate_mmd_action(
     action,
     foot_ik,
@@ -576,8 +613,11 @@ def _validate_mmd_action(
     frame_end,
     expected_bones=(),
     require_clean_fk=False,
+    pure_fk=False,
 ):
-    required = [MMD_ROOT_BONE, foot_ik["L"], foot_ik["R"]]
+    required = [MMD_ROOT_BONE]
+    if not pure_fk:
+        required.extend((foot_ik["L"], foot_ik["R"]))
     required.extend(name for name in expected_bones if name not in required)
     missing = [
         name
@@ -1761,34 +1801,21 @@ def _run_export_prep(context, settings):
             frame_end=settings.mocap_frame_end,
             reset_correction=True,
         )
-    delete_leg_fk, leg_reason = _leg_fk_cleanup_plan(armature, foot_ik)
-    if delete_leg_fk:
-        cleaned = core_export.remove_mmd_leg_fk_curves(
-            action, bone_names=MMD_LEG_FK_BONES
-        )
-        leg_ik = {
-            "operation": "key_ik_toggle_state",
-            "skipped": True,
-            "reason": "腿由 MMD 原生 IK 驱动，VMD 必须保持足ＩＫ开启",
-        }
-    else:
-        cleaned = {
-            "operation": "remove_mmd_leg_fk_curves",
-            "skipped": True,
-            "reason": leg_reason,
-            "removed_fcurve_count": 0,
-        }
-        # The legs travel on FK curves, so the receiving model has to leave its
-        # own 足ＩＫ / つま先ＩＫ alone; say so inside the VMD instead of asking
-        # the user to find the toggle in every player.
-        leg_ik = core_export.key_ik_toggle_state(
-            armature,
-            action,
-            _leg_ik_toggle_targets(armature, foot_ik),
-            enabled=False,
-            frame_start=settings.mocap_frame_start,
-            frame_end=settings.mocap_frame_end,
-        )
+    from .core import fk_export
+    pure_fk = fk_export.normalize_to_pure_fk(
+        scene, armature, action,
+        settings.mocap_frame_start, settings.mocap_frame_end)
+    cleaned = {
+        "operation": "remove_mmd_leg_fk_curves",
+        "skipped": True,
+        "reason": "纯 FK 导出：腿由烘焙出的 FK 曲线驱动",
+        "removed_fcurve_count": 0,
+    }
+    leg_ik = {
+        "operation": "key_ik_toggle_state",
+        "skipped": True,
+        "reason": "纯 FK 导出：不写 IK 开关",
+    }
     hand_export_cleanup = _prepare_mmd_mmr_hand_export_cleanup(
         scene,
         armature,
@@ -1801,7 +1828,7 @@ def _run_export_prep(context, settings):
         scene,
         armature,
         action=action,
-        bone_name=MMD_ROOT_BONE,
+        bone_name=MMD_CENTER_BONE,
         z_offset=settings.vmd_floor_offset,
         frame_start=settings.mocap_frame_start,
         frame_end=settings.mocap_frame_end,
@@ -1811,10 +1838,11 @@ def _run_export_prep(context, settings):
         foot_ik,
         settings.mocap_frame_start,
         settings.mocap_frame_end,
-        require_clean_fk=delete_leg_fk,
+        pure_fk=True,
     )
     report = {
         "operation": "prepare_mmd_vmd_export",
+        "pure_fk": pure_fk,
         "global_correction_bake": baked,
         "leg_fk_cleanup": cleaned,
         "leg_ik_toggle": leg_ik,
@@ -1831,8 +1859,8 @@ def _run_export_prep(context, settings):
         {"vmd_floor_offset": settings.vmd_floor_offset},
     )
     message = (
-        f"导出预览已生成，删除 {cleaned['removed_fcurve_count']} 条腿 FK 曲线、"
-        f"{hand_export_cleanup['removed_helper_fcurve_count']} 条手 IK 辅助曲线"
+        f"导出预览已生成（纯 FK）；根位移收拢到 センター；"
+        f"清理 {hand_export_cleanup['removed_helper_fcurve_count']} 条手 IK 辅助曲线"
     )
     if correction is None:
         message += "；未执行全局扶正，已跳过根补偿烘焙"
@@ -1999,31 +2027,15 @@ def _retarget_objects(settings):
 
 
 def _run_retarget_mmd_fk(context, settings):
-    """Direct FlowHMR -> native MMD FK retarget (no MMR, no ARP)."""
+    """Keep the retired direct writer unreachable until the template route is ready.
 
-    from .core import mmd_fk
+    In particular, fail before a checkpoint, Action replacement or constraint
+    mutation. The established MMR branch is independent of this guard.
+    """
 
-    scene = context.scene
-    source = settings.source_armature
-    target = settings.mmd_armature
-    if source is None or source.type != 'ARMATURE':
-        raise RuntimeError('请选择源骨架')
-    if target is None or target.type != 'ARMATURE':
-        raise RuntimeError('请选择 MMD 骨架')
-    if source == target:
-        raise RuntimeError('源骨架与 MMD 骨架不能相同')
-    _require_restore_before_rerun(scene, 'retarget')
-    _ensure_no_pending_preview(settings)
-    _begin_structure_preview(scene, 'retarget')
-    report = mmd_fk.retarget_to_mmd_fk(
-        scene, source, target,
-        frame_start=settings.mocap_frame_start,
-        frame_end=settings.mocap_frame_end)
-    _record_report(scene, 'retarget', report, 'PREVIEW', 'MMD FK 重定向预览已生成')
-    settings.retarget_status = ''
-    settings.status_level = 'INFO'
-    return ('MMD FK 重定向预览已生成（%d 根骨，写入校验 %.2f）'
-            % (report['bones_written'], report['max_pose_error_deg']))
+    raise RuntimeError(
+        'FlowHMR→MMD 模板路线尚未接入，旧直连已停用；'
+        '已有错误预览请先丢弃，恢复执行前状态')
 
 
 def _run_retarget(context, settings):
@@ -3333,7 +3345,8 @@ class MD_OT_MMDBake(Operator):
             with _active_armature(context, armature, pose=True):
                 bpy.ops.pose.select_all(action="DESELECT")
                 selected_names = {bone.name for bone in constrained}
-                selected_names.update((MMD_ROOT_BONE, foot_ik["L"], foot_ik["R"]))
+                # 纯 FK 导出：根位移写在 センター 上，脚 IK 目标不再烘焙。
+                selected_names.update((MMD_ROOT_BONE, MMD_CENTER_BONE))
                 for bone_name in selected_names:
                     armature.pose.bones[bone_name].bone.select = True
                 result = bpy.ops.nla.bake(
@@ -3359,28 +3372,36 @@ class MD_OT_MMDBake(Operator):
                 settings.mocap_frame_start,
                 settings.mocap_frame_end,
                 expected_bones=set(selected_names) | set(MMD_ARM_FK_BONES),
+                pure_fk=True,
             )
-            delete_leg_fk, leg_reason = _leg_fk_cleanup_plan(armature, foot_ik)
-            removed = remove_bone_fcurves(action, MMD_LEG_FK_BONES) if delete_leg_fk else []
+            # 先静音 MMR 约束，再清理：否则约束会覆盖烘焙曲线，校验等于没测。
+            muted_count = _mute_mmr_constraints(armature, rig)
+            if muted_count == 0:
+                raise RuntimeError("Bake 后没有可禁用的 MMR 约束")
+            from .core import fk_export
+            pure_fk = fk_export.normalize_to_pure_fk(
+                context.scene, armature, action,
+                settings.mocap_frame_start, settings.mocap_frame_end)
             _validate_mmd_action(
                 action,
                 foot_ik,
                 settings.mocap_frame_start,
                 settings.mocap_frame_end,
                 expected_bones=(set(selected_names) - set(MMD_LEG_FK_BONES)) | set(MMD_ARM_FK_BONES),
-                require_clean_fk=delete_leg_fk,
+                pure_fk=True,
             )
-            muted_count = _mute_mmr_constraints(armature, rig)
-            if muted_count == 0:
-                raise RuntimeError("Bake 后没有可禁用的 MMR 约束")
             project.record_step(
                 context.scene,
                 "mmd_bake",
                 "PREVIEW",
-                f"Bake 完成、禁用 {muted_count} 个 MMR 约束；{leg_reason}；删除 {len(removed)} 条腿 FK 曲线",
+                f"纯 FK 烘焙完成：根位移收拢到 センター（删 {pure_fk['removed_location_curves']} 条位置、"
+                f"{pure_fk['removed_scale_curves']} 条缩放曲线）；禁用 {muted_count} 个 MMR 约束、"
+                f"{len(pure_fk['muted_ik_constraints'])} 个 MMD IK 约束",
                 str(before),
             )
-            settings.status_message = f"MMD Bake 预览完成；{leg_reason}；已删 {len(removed)} 条腿 FK 曲线"
+            settings.status_message = (
+                f"纯 FK 烘焙预览完成；根位移已收拢到 センター；"
+                f"位置误差 {pure_fk['max_position_error_mm']:.2f} mm")
             return {"FINISHED"}
         except Exception as exc:
             settings.status_message = str(exc)
@@ -3632,13 +3653,16 @@ class MD_OT_ExportVMD(Operator):
                 raise RuntimeError("仍有活动的 MMR 到 MMD 约束，不能导出")
             action = _require_action(armature, "原生 MMD Armature")
             _require_no_nla(armature, "原生 MMD Armature")
-            delete_leg_fk, _leg_reason = _leg_fk_cleanup_plan(armature, foot_ik)
+            from .core import fk_export
+            fk_export.normalize_to_pure_fk(
+                context.scene, armature, action,
+                settings.mocap_frame_start, settings.mocap_frame_end)
             _validate_mmd_action(
                 action,
                 foot_ik,
                 settings.mocap_frame_start,
                 settings.mocap_frame_end,
-                require_clean_fk=delete_leg_fk,
+                pure_fk=True,
             )
             _require_no_keyed_vmd_name_collisions(armature, action)
             raw_path = str(settings.vmd_export_path or "").strip()
@@ -4403,6 +4427,13 @@ def _official_import_fbx(context, fbx_path: str) -> dict:
     armature = None
     if armatures:
         armature = max(armatures, key=lambda item: len(item.pose.bones))
+    # FlowHMR FBX 导出的是"规范骨架"（Mixamo 命名）。下游全部按 FlowHMR 原生名
+    # 工作，所以这里一次性改名（骨 + 顶点组 + 曲线路径），不做兼容分支。
+    naming = {"applied": False, "renamed": 0, "conflicts": [],
+              "vertex_groups": 0, "fcurves": 0}
+    if armature is not None:
+        from .core import source_naming
+        naming = source_naming.canonicalize_armature(armature)
     notes = []
     if armature is not None and armature.name != "Reference":
         if "Reference" not in {obj.name for obj in bpy.data.objects if obj not in new_objects}:
@@ -4421,6 +4452,7 @@ def _official_import_fbx(context, fbx_path: str) -> dict:
         "armature": armature,
         "armature_name": armature.name if armature is not None else "",
         "bones": len(armature.pose.bones) if armature is not None else 0,
+        "naming": naming,
         "notes": notes,
     }
 

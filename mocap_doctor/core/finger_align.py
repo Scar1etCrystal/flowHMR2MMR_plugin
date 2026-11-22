@@ -8,8 +8,12 @@ Facts this file is built on (all measured on the user's rig):
 * The digit chain already has a small rest curvature: the armature itself
   stores 2.9-15.1 degrees between consecutive finger bones, so "straight" is a
   property of the data, not of the pose.
-* The amount of curl per unit of scale differs per finger, so each finger is
-  calibrated on its own.
+* The amount of curl per unit of scale differs per finger *and is not linear*,
+  so each finger is calibrated as a **response curve**: the total bend is sampled
+  at many scales, and the scale for a wanted bend is read back from that curve.
+  A single-point slope (the old formula) badly over/undershoots on the middle
+  finger: measured 148 deg/unit where the real response is ~427 deg/unit, which
+  pushed the scale into the 0.05 floor and shrank the whole finger.
 
 The correction fits each finger onto its controller: rotation aims it along the
 source chord, uniform scale reproduces the source curl *total*, and the joint
@@ -27,6 +31,70 @@ from .animation import (bone_path, current_view_layer, get_action,
                         set_scene_frame, update_action)
 
 FIT_STEMS = ('f_index', 'f_middle', 'f_ring', 'f_pinky', 'thumb')
+
+# 标定采样点：从 1.0（原尺寸）到 0.05（最大弯曲）。响应是非线性的，采样要密，
+# 否则反查出来的 scale 仍然会偏。
+CALIBRATION_SCALES = (
+    1.0, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82,
+    0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45, 0.40, 0.35,
+    0.30, 0.25, 0.20, 0.15, 0.10, 0.05,
+)
+MIN_SCALE = CALIBRATION_SCALES[-1]
+
+
+def _build_curve(samples):
+    """``[(bend, scale)]``，只取“scale 从 1.0 走到峰值”这段单调支。
+
+    实测响应是**单峰**的：食指在 scale≈0.5 处弯到 267° 见顶，中指在 0.45 处
+    261° 见顶，再往下压反而重新展开（几何翻转）。若把所有采样点按 bend 排序，
+    下降支的低弯曲点会混进上升支，反查 189° 就会落到 scale=0.05 的下降支上——
+    这正是之前中指被压到 5% 的原因。所以这里只保留到峰值为止的单调段，并把
+    峰前的凹陷（中指在 0.95 处会掉到 9.8°）丢掉。
+    """
+
+    ordered = sorted((float(scale), float(bend)) for scale, bend in samples)
+    ordered.reverse()                       # scale 从 1.0 递减
+    if not ordered:
+        return []
+    peak = max(range(len(ordered)), key=lambda index: ordered[index][1])
+    curve = []
+    for scale, bend in ordered[:peak + 1]:
+        if curve and bend <= curve[-1][0]:
+            continue
+        curve.append((bend, scale))
+    return curve
+
+
+def _scale_for_bend(samples, target):
+    """反查：想要 ``target`` 度总弯曲，该给多少 scale；返回 ``(scale, saturated)``。
+
+    按 scale 从 1.0 递减扫描，**只扫到响应峰值为止**，取第一个达到目标的区间再插值。
+    两个坑都在这里避开：
+
+    * 中指在 0.85–1.0 之间非单调（1.0→29.7°、0.95→9.8°、0.9→25.7°、0.85→51.9°），
+      所以扫描时保留凹陷、不预先排序去重，才不会把 40° 这类低目标查错区间；
+    * 压过峰值后手指会重新展开（0.05 只有 186°），所以目标超过峰值时必须直接给
+      **峰值 scale**，而不是一路扫到底拿 0.05——那正是把手指压扁的老 bug。
+    """
+
+    if not samples:
+        return 1.0, False
+    ordered = sorted(((float(scale), float(bend)) for scale, bend in samples),
+                     key=lambda item: -item[0])
+    peak_index = max(range(len(ordered)), key=lambda index: ordered[index][1])
+    peak_scale, peak_bend = ordered[peak_index]
+    if target <= ordered[0][1]:
+        return ordered[0][0], False
+    if target >= peak_bend:
+        return peak_scale, True
+    previous = ordered[0]
+    for scale, bend in ordered[1:peak_index + 1]:
+        if bend >= target:
+            span = bend - previous[1]
+            ratio = 1.0 if span <= 1e-9 else (target - previous[1]) / span
+            return previous[0] + (scale - previous[0]) * ratio, False
+        previous = (scale, bend)
+    return peak_scale, True
 
 
 def _fit_names(stem, side):
@@ -138,7 +206,14 @@ def _flat_details(rig, names):
 
 
 def calibrate_finger_curl(rig, layer):
-    """Base bend from rest data; per-unit curl measured with no action linked."""
+    """Measure each finger's scale -> bend response (no action linked).
+
+    Returns ``{(side, stem): {"base": float, "curve": [(bend, scale), ...]}}``.
+    ``curve`` is sorted by bend (ascending), so a wanted bend maps straight back
+    to a scale.  Sampling the whole range is what keeps the middle finger honest:
+    its response around 0.85 is shallow but steepens lower down, so the old
+    single-point slope under-estimated it by ~3x.
+    """
 
     result = {}
     animation = rig.animation_data
@@ -164,20 +239,21 @@ def calibrate_finger_curl(rig, layer):
             master_name, digits = _fit_names(stem, side)
             _flat_details(rig, digits)
             master = rig.pose.bones[master_name]
-            master.scale = (1.0, 1.0, 1.0)
-            layer.update()
-            measured = _finger_total_bend(rig, digits)
-            base = _rest_total_bend(rig, digits)
-            if measured is not None and abs(measured - base) > 1.0:
-                # 求值与 rest 不一致时以实测为准（约束可能改变了链条）。
-                base = measured
-            master.scale = (0.85, 0.85, 0.85)
-            layer.update()
-            bent = _finger_total_bend(rig, digits)
-            if bent is None or bent <= base:
-                result[key] = (base, 360.0)
-            else:
-                result[key] = (base, (bent - base) / 0.15)
+            samples = []
+            for scale in CALIBRATION_SCALES:
+                master.scale = (scale, scale, scale)
+                layer.update()
+                bend = _finger_total_bend(rig, digits)
+                if bend is None:
+                    continue
+                samples.append((scale, bend))
+            if not samples:
+                continue
+            base = samples[0][1]
+            rest = _rest_total_bend(rig, digits)
+            if abs(base - rest) > 1.0:
+                base = base
+            result[key] = {'base': base, 'curve': samples}
     finally:
         for key, (scale, quaternions) in saved.items():
             side, stem = key
@@ -216,6 +292,7 @@ def fit_finger_masters(scene, rig, action, *, frame_start, frame_end, strength=1
     paths = set()
     max_curl_error = 0.0
     limited_count = 0
+    saturated_count = 0
     worst = None
     samples = []
     calibration = {}
@@ -238,12 +315,18 @@ def fit_finger_masters(scene, rig, action, *, frame_start, frame_end, strength=1
                         continue
                     target_bend = sum(math.degrees(current[0].angle(direction))
                                       for direction in current[1:])
-                    base, per_unit = calibration[key]
+                    entry = calibration[key]
+                    base = entry['base']
+                    curve = entry['curve']
                     if target_bend <= base + 0.5:
                         scale_y = 1.0
                     else:
-                        scale_y = 1.0 - (target_bend - base) / max(per_unit, 1.0)
-                        scale_y = max(0.05, min(1.0, scale_y))
+                        # 在实测响应曲线上反查，而不是用单点斜率外推：
+                        # 斜率在中指上偏小 3 倍，会把 scale 推到 0.05 死值。
+                        scale_y, saturated = _scale_for_bend(curve, target_bend)
+                        if saturated:
+                            saturated_count += 1
+                        scale_y = max(MIN_SCALE, min(1.0, scale_y))
                     desired = (rig.pose.bones[digits[2]].tail
                                - rig.pose.bones[digits[0]].head)
                     if desired.length < 1e-8:
@@ -283,7 +366,7 @@ def fit_finger_masters(scene, rig, action, *, frame_start, frame_end, strength=1
                     if achieved is None:
                         continue
                     expected = targets[(side, stem, frame)]
-                    base = calibration.get((side, stem), (0.0, 360.0))[0]
+                    base = calibration.get((side, stem), {'base': 0.0})['base']
                     limited = expected <= base + 0.5
                     if limited:
                         limited_count += 1
@@ -305,8 +388,18 @@ def fit_finger_masters(scene, rig, action, *, frame_start, frame_end, strength=1
         'curl_limited_frames': limited_count,
         'curl_worst_sample': worst,
         'curl_samples': samples[:16],
-        'calibration': {f'{side}_{stem}': [round(base, 1), round(per_unit, 1)]
-                        for (side, stem), (base, per_unit) in calibration.items()},
+        'calibration': {
+            f'{side}_{stem}': {
+                'base': round(entry['base'], 1),
+                'points': len(entry['curve']),
+                'bend_at_1': round(entry['curve'][0][1], 1) if entry['curve'] else None,
+                'peak_bend': round(max(b for _s, b in entry['curve']), 1) if entry['curve'] else None,
+                'peak_scale': round(min(entry['curve'], key=lambda item: -item[1])[0], 3)
+                              if entry['curve'] else 1.0,
+            }
+            for (side, stem), entry in calibration.items()
+        },
+        'saturated_frames': saturated_count,
         'rotation_paths_written': sorted(paths),
         'location_curves_written': 0,
         'scale_curves_written': len(scale_points) * 3,

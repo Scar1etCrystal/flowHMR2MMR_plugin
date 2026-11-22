@@ -64,6 +64,8 @@ DEFAULT_CLOSE_FADE_RATIO = 1.50
 DEFAULT_CROSSING_FADE_FRAMES = 6
 DEFAULT_CROSSING_DETECTION_FRAMES = 24
 DEFAULT_CROSSING_MIN_GAP_RATIO = 0.08
+# 补偿向量逐帧最大变化（米）；只用于削掉交叉帧的方向翻转尖峰。
+MAX_OFFSET_STEP_M = 0.01
 
 
 def foot_crossing_clearance_weights(
@@ -273,6 +275,7 @@ def compensate_foot_spacing_ik(
             1 for weight in crossing_weights.values() if weight < 0.999999
         )
 
+        raw_samples = []
         for frame in frames:
             set_scene_frame(scene, frame, view_layer)
             drive_l = rig.pose.bones[ik_bones["L"]].matrix.translation.copy()
@@ -306,8 +309,24 @@ def compensate_foot_spacing_ik(
             else:
                 missing_gap = source_flat_gap + target_flat_gap
             direction = rest_side_axis * direction_sign
-            offset = direction * (missing_gap * 0.5 / max(target_scale, 1e-8))
-            samples.append((frame, drive_l + offset, drive_r - offset, missing_gap))
+            # 交叉点附近按权重淡出：方向翻转时补偿从 0 平滑过渡，而不是在
+            # 单帧里反向（medical1 582 帧的爆跳）；交叉本身仍会按源顺序发生。
+            fade = crossing_weights.get(frame, 1.0)
+            offset = direction * (missing_gap * 0.5 / max(target_scale, 1e-8)) * fade
+            raw_samples.append((frame, drive_l, drive_r, offset, missing_gap * fade))
+
+        # 中值滤波：只在交叉那一帧方向会翻，单帧补偿向量是离群值；取三帧
+        # 中值能把这一帧的尖峰换回邻帧的值，而真正的交叉过渡会保留下来。
+        offsets = [item[3] for item in raw_samples]
+        for index in range(len(raw_samples)):
+            window = offsets[max(0, index - 1):min(len(offsets), index + 2)]
+            median = Vector((
+                sorted(vector.x for vector in window)[len(window) // 2],
+                sorted(vector.y for vector in window)[len(window) // 2],
+                sorted(vector.z for vector in window)[len(window) // 2],
+            ))
+            frame, drive_l, drive_r, _old_offset, gap = raw_samples[index]
+            samples.append((frame, drive_l + median, drive_r - median, gap))
 
         # --- the actual write: IK control translation only, no rotations -----
         compensated_frames = 0

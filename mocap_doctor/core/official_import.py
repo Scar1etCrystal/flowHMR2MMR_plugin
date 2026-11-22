@@ -1,43 +1,36 @@
-"""官方 FlowHMR 产物一键导入：take 目录 → ``final.fbx`` + npz + 参考视频。
+"""动作数据目录导入：像 ``F:\\T1`` 这样的扁平目录 → 骨架 + 贴地数据（+ 可选参考视频）。
 
-主布局（用户 2026-10-06 确认，以这条为准）::
+当前格式（破坏性变更后只认这一种布局）::
 
-    F:\\flowhmr_pack\\outputs\\video_to_fbx\\<take_hash>\\
-        final.fbx               52 骨 ``Reference`` 骨架（source）
-        body_postprocess.npz    Rh/betas/poses/trans（**没有** foot_contacts）
-        final.npz               同上（后处理前的 body 结果）
-        working_30fps.mp4       30 fps 参考视频
-        camera.npz / main_track.npz / sam_mean_components.npz / hands\\*.pkl
-                                相机、轨迹、HaMeR 手部（本模块不用）
+    F:\\T1\\
+        PREVIEW <name>_flowhmr_skin_t_pose.fbx    SMPL-H 网格 + 规范骨架，自带整段动作
+        PREVIEW <name>_flowhmr.npz                poses(T,156) / trans / betas /
+                                                  mocap_framerate / gender
 
-临时布局（过渡期，仍然支持）::
+特点与处理方式：
 
-    F:\\flowhmr_official_out\\<take>_OFFICIAL_post.fbx / .npz
+* 文件名带 ``PREVIEW `` 前缀，目录是**平的**：没有 take 子目录，也没有 mp4 与
+  ``video_info.json``；找不到视频时参考视频平面直接跳过，不影响动作导入。
+* FBX 骨架使用**规范命名**（``Hips`` / ``LeftUpLeg`` / ``LeftHandIndex1`` …），
+  导入时由 :mod:`mocap_doctor.core.source_naming` 一次性改成 FlowHMR 原生名
+  （``Pelvis`` / ``L_Hip`` / ``L_Index1`` …，骨骼 + 顶点组 + 曲线路径三处同步）。
+  下游（bmap 源骨名、脚部几何检测、FIX A/B/C、手/脚间距）只看原生名。
+* npz **没有** ``foot_contacts``，所以贴地区间由骨架几何推断
+  （``CONTACT_GEOMETRY``）；有分数时（老文件）仍然优先用分数（``CONTACT_TAKE``）。
 
-接触分数（官方第 5 步 ``foot_contacts`` 的输入）取得顺序——**显式、可见，绝不静默**：
+接触分数取值顺序——只有两档，**显式、可见**：
 
-1. ``TAKE``            take 目录里任一 npz 带 ``foot_contacts`` → 用它；
-2. ``OFFICIAL_TEMP``   没有就找**同 take** 的临时官方 npz
-                       （``flowhmr_official_out\\<take>_OFFICIAL_post.npz``）→ 用它，
-                       状态行注明「分数来自临时官方 npz，不是 take 目录」；
-3. ``GEOMETRY``        都没有 → 回退几何检测器，状态行写
-                       「无接触分数，planted 由几何推断」。
+1. ``CONTACT_TAKE``      目录里存在带 ``foot_contacts`` 的 body npz → 用它；
+2. ``CONTACT_GEOMETRY``  没有 → 回退几何检测，状态行注明。
 
-第 3 条**只让 planted 那一步降级**：FBX / 视频 / joints 的导入照常工作。
+（历史分支「同 take 临时官方 npz ``F:\\flowhmr_official_out``」已删除：它按 take
+token 做前缀匹配，``t1`` 会命中 ``t1499_OFFICIAL_nopost.npz`` 这类无关文件，
+把别的动作的接触数据静默套到当前 take 上。）
 
-视频平面（用户原话：把参考视频以 mesh plane 导入，放到地平面上，正面朝 Y−）：
-变换规格**由用户给死、顺序不能变**：绕 Z 轴 −90° → 沿 +Y 平移 1.0 m → 放大 ×1.5
-→ **先缩放、再把底边对齐地面**（对齐用缩放后的包围盒最低点）。
+视频平面（``MCD_reference_video``）仅在目录里存在 mp4 时创建；变换规格不变：
+绕 Z 轴 −90° → 沿 +Y 平移 1.0 m → 放大 ×1.5 → 先缩放再把底边对齐地面。
 
-* 竖直面，世界法向 **−Y**（局部网格法向 +X，RZ(−90°) 正好把它送到 −Y），
-  Blender 正视图 numpad-1 从 −Y 看过去正对画面；
-* 底边贴 **Z=0**（缩放之后再抬）、X 居中、宽高按视频真实宽高比；
-* 高度是参数（默认 1.60 m ≈ 模型 身高，是**缩放前**的基准；世界高度 = 基准 × 1.5）；
-* 沿 Y 的位置是参数，默认 **+1.0 m**（用户指定）：角色静止朝 −Y、正视镜头在 −Y 一侧，
-  平面放在 +Y 就是「角色在画面前面、视频在后面」，1 m 也不会插进角色身体；
-* 帧对齐：视频帧号是 1 基，``Blender 帧 f 显示视频第 f−offset 帧``（默认 offset=0；
-  npz 第 i 帧 ↔ Blender 第 i+``npz_frame_offset`` 帧，默认 1 与
-  ``foot_contacts.DEFAULT_FRAME_OFFSET`` 一致）。
+帧范围取自导入 Action 的 ``frame_range``（新格式是 0–7010，落到场景即 1–7010）。
 """
 
 from __future__ import annotations
@@ -61,10 +54,6 @@ TAKE_NPZ_PREFERRED = BODY_NPZ_NAMES
 NPZ_CHOICE_AUTO = "AUTO"
 TAKE_VIDEO_NAMES = ("working_30fps.mp4",)
 
-# --- 临时官方产物目录（第 2 条分支） ---------------------------------------
-OFFICIAL_ROOT = r"F:\flowhmr_official_out"
-OFFICIAL_NPZ_SUFFIX = "_OFFICIAL_post.npz"
-
 # --- 视频平面默认值/理由 ---------------------------------------------------
 # 用户给的变换规格（顺序不能变）：RZ −90° → +Y 1.0 m → ×1.5 → **先缩放再对齐地面**。
 DEFAULT_PLANE_RZ_DEG = -90.0       # 局部 +X 法向 → 世界 −Y（正视图 numpad-1 正对画面）
@@ -75,12 +64,11 @@ PLANE_OBJECT_NAME = "MCD_reference_video"
 PLANE_MATERIAL_NAME = "MCD_reference_video_mat"
 
 CONTACT_TAKE = "TAKE"
-CONTACT_OFFICIAL_TEMP = "OFFICIAL_TEMP"
 CONTACT_GEOMETRY = "GEOMETRY"
 
 TAKE_DIR_HINT = (
-    r"F:\flowhmr_pack\outputs\video_to_fbx\<take_hash>  （内含 final.fbx / "
-    "final.npz + body_postprocess.npz + body_origin.npz / working_30fps.mp4）"
+    r"F:\T1  （内含 PREVIEW <name>_flowhmr_skin_t_pose.fbx + PREVIEW <name>_flowhmr.npz；"
+    "扁平目录，无需 take 子目录和视频）"
 )
 FOOT_CONTACTS_KEY = "foot_contacts"
 
@@ -126,7 +114,9 @@ def pick_fbx(take_dir: str, names: Sequence[str] = TAKE_FBX_NAMES) -> str:
         )
     except OSError:
         return ""
-    return found[0] if found else ""
+    # 新格式只有一支 ``*flowhmr*_skin_t_pose.fbx``；同目录混入别的 fbx 时优先它。
+    preferred = [path for path in found if "flowhmr" in os.path.basename(path).lower()]
+    return (preferred or found)[0] if found else ""
 
 
 def is_body_npz(path: str) -> bool:
@@ -157,7 +147,10 @@ def pick_npz(take_dir: str, preferred: Sequence[str] = TAKE_NPZ_PREFERRED) -> st
         )
     except OSError:
         return ""
-    for entry in entries:
+    # 首选名字里带 flowhmr 的（新格式 ``PREVIEW <name>_flowhmr.npz``），
+    # 其余按字母序挑第一个真的是 body 结果的，避免抓到 bbox / camera 这类旁路文件。
+    ordered = sorted(entries, key=lambda name: (0 if "flowhmr" in name.lower() else 1, name))
+    for entry in ordered:
         cand = os.path.join(take_dir, entry)
         if is_body_npz(cand):
             return cand
@@ -234,43 +227,6 @@ def npz_has_foot_contacts(path: str) -> bool:
         return "foot_contacts" in npz_keys(path)
     except Exception:  # noqa: BLE001 - 读不了的 npz 当作「没有」
         return False
-
-
-def official_npz_for_take(
-    take_dir: str,
-    official_root: str = OFFICIAL_ROOT,
-    *,
-    take_token: str | None = None,
-) -> str:
-    """同 take 的临时官方 npz（``<official_root>\\<take>*_OFFICIAL_post.npz``）。
-
-    先按 take token（``t999_H4_b8abd355e6f2`` → ``t999``）找，再退到「文件名以 take
-    token 开头且带 foot_contacts」的任意 npz；找不到返回空串。只读，不写。
-    """
-
-    if not official_root or not os.path.isdir(official_root):
-        return ""
-    from . import foot_contacts as fc
-
-    token = take_token or fc.take_identity(take_dir)
-    if not token:
-        return ""
-    exact = os.path.join(official_root, f"{token}{OFFICIAL_NPZ_SUFFIX}")
-    if os.path.isfile(exact) and npz_has_foot_contacts(exact):
-        return exact
-    try:
-        entries = sorted(os.listdir(official_root))
-    except OSError:
-        return ""
-    for entry in entries:
-        if not entry.lower().endswith(".npz"):
-            continue
-        if not entry.lower().startswith(token.lower()):
-            continue
-        cand = os.path.join(official_root, entry)
-        if npz_has_foot_contacts(cand):
-            return cand
-    return ""
 
 
 def load_foot_contacts(path: str) -> Any:
@@ -416,14 +372,17 @@ def find_contacts(
     take_dir: str,
     *,
     explicit: str = "",
-    official_root: str = OFFICIAL_ROOT,
     choice: str = NPZ_CHOICE_AUTO,
 ) -> dict[str, Any]:
     """接触分数按 1/2/3 顺序解析，返回来源与**面板原样显示**的状态文字。
 
     返回 ``{"source", "path", "frames", "status", "note"}``；``source`` 取
-    ``CONTACT_TAKE`` / ``CONTACT_OFFICIAL_TEMP`` / ``CONTACT_GEOMETRY``。
+    ``CONTACT_TAKE`` / ``CONTACT_GEOMETRY``。
     第 1 档会把「三份 npz 的 foot_contacts 是否一致」写进 ``status``（运行时校验）。
+
+    旧的「同 take 临时官方 npz」（``F:\flowhmr_official_out``）分支已删除：它按 take
+    token 做**前缀**匹配，``t1`` 会命中 ``t1499_OFFICIAL_nopost.npz`` 这种无关文件，
+    等于把别的动作的接触数据静默套到当前 take 上。
     """
 
     if explicit:
@@ -480,25 +439,12 @@ def find_contacts(
                 "consistency": consistency,
             }
 
-    # 2) 同 take 的临时官方 npz
-    official = official_npz_for_take(take_dir, official_root)
-    if official:
-        return {
-            "source": CONTACT_OFFICIAL_TEMP,
-            "path": official,
-            "frames": npz_frame_count(official),
-            "status": "接触分数：**分数来自临时官方 npz，不是 take 目录**"
-                      f"（{official}，{npz_frame_count(official)} 帧）",
-            "note": "official temp",
-        }
-
-    # 3) 几何回退
+    # 2) 几何回退：npz 里没有 foot_contacts（新格式就是这样）
     return {
         "source": CONTACT_GEOMETRY,
         "path": "",
         "frames": 0,
-        "status": "接触分数：无接触分数，planted 由几何推断"
-                  "（take 目录 npz 无 foot_contacts，也没有同 take 官方 npz）",
+        "status": "接触分数：npz 无 foot_contacts，planted 由骨架几何推断",
         "note": "geometry fallback",
     }
 
@@ -506,7 +452,6 @@ def find_contacts(
 def scan_take_dir(
     path: str,
     *,
-    official_root: str = OFFICIAL_ROOT,
     contacts_explicit: str = "",
     npz_choice: str = NPZ_CHOICE_AUTO,
 ) -> dict[str, Any]:
@@ -536,7 +481,6 @@ def scan_take_dir(
     if not info["exists"]:
         info["status"] = f"找不到 take 目录：{take_dir or '(空)'}　例：{TAKE_DIR_HINT}"
         info["contacts"] = find_contacts("", explicit=contacts_explicit,
-                                         official_root=official_root,
                                          choice=npz_choice)
         return info
 
@@ -556,12 +500,11 @@ def scan_take_dir(
     info["video"] = video
     info["video_note"] = video_note
     info["contacts"] = find_contacts(take_dir, explicit=contacts_explicit,
-                                     official_root=official_root,
                                      choice=npz_choice)
 
     take_label = os.path.basename(take_dir.rstrip("\\/")) or take_dir
     parts = [f"take={take_label}"]
-    parts.append(f"final.fbx={'有' if info['fbx'] else '缺'}")
+    parts.append("动作文件=" + (os.path.basename(info['fbx']) if info['fbx'] else '缺'))
     parts.append(
         f"npz={os.path.basename(info['npz'])}"
         f"（{info['npz_frames']} 帧）" if info["npz"] else "npz=缺"
