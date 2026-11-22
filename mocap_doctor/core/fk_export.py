@@ -119,6 +119,7 @@ def normalize_to_pure_fk(scene, armature, action=None, frame_start=None,
     removed_location = 0
     removed_scale = 0
     removed_ik = 0
+    toggle_curves_kept = 0
     for fcurve in list(action.fcurves):
         path = str(fcurve.data_path)
         bone_name = _channel_bone(fcurve)
@@ -126,7 +127,14 @@ def normalize_to_pure_fk(scene, armature, action=None, frame_start=None,
             action.fcurves.remove(fcurve)
             removed_scale += 1
             continue
-        if "mmd_ik_toggle" in path or "constraints[" in path:
+        if "mmd_ik_toggle" in path:
+            # mmd_tools 的 VMD 导出器**只**从这条曲线生成「禁用 IK」段
+            # (core/vmd/exporter.py:256 收集 / :377 写出骨名)。删掉它，VMD 里就
+            # 没有 IK 段，接收模型默认开着的 足ＩＫ 会把 FK 腿拉回原姿势。
+            # 所以这里保留曲线，改为在下面统一写 OFF。
+            toggle_curves_kept += 1
+            continue
+        if "constraints[" in path:
             action.fcurves.remove(fcurve)
             removed_ik += 1
             continue
@@ -152,11 +160,32 @@ def normalize_to_pure_fk(scene, armature, action=None, frame_start=None,
     update_action(action)
 
     muted_ik = []
+    ik_toggle_bones = []
     for pose_bone in armature.pose.bones:
         for constraint in pose_bone.constraints:
-            if constraint.type == "IK" and not constraint.mute:
+            if constraint.type != "IK":
+                continue
+            if not constraint.mute:
                 constraint.mute = True
                 muted_ik.append(f"{pose_bone.name}:{constraint.name}")
+            # IK 约束的 subtarget 就是 IK 骨（足ＩＫ / つま先ＩＫ …）
+            target_name = str(getattr(constraint, "subtarget", "") or "")
+            ik_bone = armature.pose.bones.get(target_name)
+            if ik_bone is not None and hasattr(ik_bone, "mmd_ik_toggle"):
+                if target_name not in ik_toggle_bones:
+                    ik_toggle_bones.append(target_name)
+
+    if ik_toggle_bones:
+        with preserve_scene_frame(scene, layer):
+            for name in ik_toggle_bones:
+                pose_bone = armature.pose.bones[name]
+                pose_bone.mmd_ik_toggle = False
+                for frame in (frames[0], frames[-1]):
+                    pose_bone.keyframe_insert("mmd_ik_toggle", frame=frame,
+                                              group=name)
+        set_linear_for_paths(action, {bone_path(name, "mmd_ik_toggle")
+                                      for name in ik_toggle_bones})
+        update_action(action)
 
     max_position = 0.0
     max_rotation = 0.0
@@ -189,6 +218,8 @@ def normalize_to_pure_fk(scene, armature, action=None, frame_start=None,
         "removed_ik_curves": removed_ik,
         "center": CENTER_BONE,
         "muted_ik_constraints": muted_ik,
+        "ik_toggle_off_bones": list(ik_toggle_bones),
+        "kept_ik_toggle_curves": toggle_curves_kept,
         "max_position_error_mm": round(max_position * 1000.0, 3),
         "max_rotation_error_deg": round(max_rotation, 4),
     }
